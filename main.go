@@ -89,7 +89,7 @@ func (a *Agent) Run(ctx context.Context) error {
 	readUserInput := true
 	for {
 		if readUserInput {
-			fmt.Print("[94mYou[0m: ")
+			fmt.Print("\x1b[2m❯\x1b[0m ")
 			userInput, ok := a.getUserMessage()
 			if !ok {
 				break
@@ -107,7 +107,7 @@ func (a *Agent) Run(ctx context.Context) error {
 		for _, block := range message.Content {
 			switch variant := block.AsAny().(type) {
 			case anthropic.TextBlock:
-				fmt.Printf("[93mClaude[0m: %s\n", variant.Text)
+				fmt.Printf("⏺ %s\n", variant.Text)
 			case anthropic.ToolUseBlock:
 				result := a.executeTool(variant.ID, variant.Name, []byte(variant.JSON.Input.Raw()))
 				toolResults = append(toolResults, result)

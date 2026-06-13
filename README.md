@@ -16,10 +16,16 @@ On startup it reads the OAuth token Claude Code stores in the macOS Keychain
 
 No `ANTHROPIC_API_KEY` needed. Requires being logged in to Claude Code (`/login`).
 
+## Install
+
+```sh
+go install github.com/sunfmin/agentic-go-cli@latest
+```
+
 ## Run
 
 ```sh
-go run .
+agentic-go-cli
 ```
 
 Then chat. The agent has a single tool — `bash` — which covers everything

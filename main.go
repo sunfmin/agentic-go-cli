@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bufio"
 	"context"
 	"encoding/json"
 	"flag"
@@ -14,6 +13,7 @@ import (
 	"github.com/anthropics/anthropic-sdk-go/option"
 	"github.com/sunfmin/agentic-go-cli/internal/agent"
 	"github.com/sunfmin/agentic-go-cli/internal/tool"
+	"github.com/sunfmin/agentic-go-cli/internal/ui"
 )
 
 func main() {
@@ -32,17 +32,9 @@ func main() {
 		option.WithHeader("anthropic-beta", "oauth-2025-04-20"),
 	)
 
-	scanner := bufio.NewScanner(os.Stdin)
-	getUserMessage := func() (string, bool) {
-		if !scanner.Scan() {
-			return "", false
-		}
-		return scanner.Text(), true
-	}
-
 	a := agent.New(
 		agent.NewAnthropicModel(&client),
-		getUserMessage,
+		ui.ReadInput,
 		[]tool.ToolDefinition{
 			tool.ReadDefinition,
 			tool.EditDefinition,
@@ -51,6 +43,9 @@ func main() {
 			tool.DescribeDefinition,
 		},
 	)
+
+	cwd, _ := os.Getwd()
+	ui.PrintWelcome("Claude Opus 4.8 · Claude Code OAuth", cwd)
 
 	// Bare startup resumes the most recent Session; --new opts out; --resume
 	// targets a specific one.
@@ -61,14 +56,14 @@ func main() {
 			fmt.Fprintln(os.Stderr, "failed to resume session:", err)
 			os.Exit(1)
 		}
-		fmt.Println("Resumed session", *resumeID)
+		ui.PrintHint("Resumed session " + *resumeID)
 	case !*newSession:
 		if dir, ok := agent.MostRecentSession(); ok {
 			if err := a.Load(dir); err != nil {
 				fmt.Fprintln(os.Stderr, "failed to resume session:", err)
 				os.Exit(1)
 			}
-			fmt.Println("Resumed", dir, "(--new for a fresh session)")
+			ui.PrintHint("Resumed " + dir + "  (--new for a fresh session)")
 		}
 	}
 

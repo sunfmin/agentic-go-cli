@@ -27,5 +27,8 @@ command output is stored as an Artifact, retained by default until forgotten.
 - Collapsing an older tool result must preserve the `tool_use` / `tool_result` block
   pairing — replace the result's *content* with the Manifest entry, keep the IDs — or
   the API rejects the request. Forgetting means dropping the assistant `tool_use` and
-  its paired `tool_result` together.
+  its paired `tool_result` together. (Amended by ADR-0004: this holds only within the
+  full-Turn window; a collapsed Turn drops its `tool_use`/`tool_result` plumbing as a
+  unit, and the Manifest moves out of `tool_result` positions into a standalone
+  section.)
 - Requires the structured tools of ADR-0001 to know each call's file identity.

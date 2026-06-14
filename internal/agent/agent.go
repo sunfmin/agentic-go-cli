@@ -16,6 +16,10 @@ import (
 	"github.com/sunfmin/agentic-go-cli/internal/ui"
 )
 
+// defaultModel is the Anthropic model the real Model uses and the name recorded
+// in the Session index for provenance.
+const defaultModel = anthropic.ModelClaudeOpus4_8
+
 // Model is the seam over the Anthropic Messages API so the agent loop can be
 // driven by a scripted fake in tests.
 type Model interface {
@@ -33,7 +37,7 @@ func NewAnthropicModel(client *anthropic.Client) Model {
 
 func (m anthropicModel) Next(ctx context.Context, messages []anthropic.MessageParam, tools []anthropic.ToolUnionParam) (*anthropic.Message, error) {
 	return m.client.Messages.New(ctx, anthropic.MessageNewParams{
-		Model:     anthropic.ModelClaudeOpus4_8,
+		Model:     defaultModel,
 		MaxTokens: 16000,
 		// Claude Code OAuth tokens are only valid for requests that
 		// identify as Claude Code in the first system block.
@@ -177,6 +181,7 @@ type Agent struct {
 	round  int // Round: one model response within a Turn
 
 	sessionDir  string // this Session's on-disk directory; created lazily
+	createdAt   string // RFC3339 timestamp recorded in the index, set on first persist
 	artifactSeq int
 	refSeq      int
 }

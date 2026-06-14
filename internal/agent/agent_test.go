@@ -322,35 +322,37 @@ func TestSessionPersistedToDisk(t *testing.T) {
 		t.Fatalf("run: %v", err)
 	}
 
-	data, err := os.ReadFile(filepath.Join(a.sessionDir, sessionFileName))
+	// session.json is gone; the lean index.json takes its place.
+	if _, err := os.Stat(filepath.Join(a.sessionDir, "session.json")); !os.IsNotExist(err) {
+		t.Fatalf("session.json should no longer be written")
+	}
+	data, err := os.ReadFile(filepath.Join(a.sessionDir, indexFileName))
 	if err != nil {
-		t.Fatalf("session file not written: %v", err)
+		t.Fatalf("index file not written: %v", err)
 	}
-	var st sessionState
+	// The index carries no tool content — output lives in runs/, prose in turns/.
+	if strings.Contains(string(data), `"content"`) {
+		t.Fatalf("index.json leaked tool content:\n%s", data)
+	}
+	var st indexState
 	if err := json.Unmarshal(data, &st); err != nil {
-		t.Fatalf("session JSON: %v", err)
+		t.Fatalf("index JSON: %v", err)
 	}
-
-	if len(st.EventLog) == 0 {
-		t.Fatalf("event log not persisted")
+	if st.Turn != 1 {
+		t.Fatalf("index turn = %d, want 1", st.Turn)
 	}
-	var runEntry *entryState
-	for i := range st.WorkingSet {
-		if st.WorkingSet[i].ID == "c1" {
-			runEntry = &st.WorkingSet[i]
+	var runEntry *entryIndex
+	for i := range st.Entries {
+		if st.Entries[i].ID == "c1" {
+			runEntry = &st.Entries[i]
 		}
 	}
 	if runEntry == nil || runEntry.Kind != "run" {
 		t.Fatalf("working set missing the run entry")
 	}
-	found := false
-	for _, line := range st.Manifest {
-		if strings.Contains(line, "printed hi") {
-			found = true
-		}
-	}
-	if !found {
-		t.Fatalf("manifest does not reflect the gist; got %v", st.Manifest)
+	// describe upgraded the entry's Description to the gist.
+	if runEntry.Desc != "printed hi" {
+		t.Fatalf("run entry desc = %q, want the gist %q", runEntry.Desc, "printed hi")
 	}
 }
 

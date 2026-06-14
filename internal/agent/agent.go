@@ -173,7 +173,8 @@ type Agent struct {
 
 	events []event
 	ws     *workingSet
-	turn   int
+	turn   int // Turn: one user prompt plus the entire AI reply that follows
+	round  int // Round: one model response within a Turn
 
 	sessionDir  string // this Session's on-disk directory; created lazily
 	artifactSeq int
@@ -201,6 +202,7 @@ func (a *Agent) Run(ctx context.Context) error {
 			if !ok {
 				break
 			}
+			a.turn++
 			a.events = append(a.events, event{kind: evUser, text: userInput})
 		}
 
@@ -209,7 +211,7 @@ func (a *Agent) Run(ctx context.Context) error {
 			return err
 		}
 		a.events = append(a.events, event{kind: evAssistant, asst: message})
-		a.turn++
+		a.round++
 
 		ids := []string{}
 		for _, block := range message.Content {
@@ -230,6 +232,9 @@ func (a *Agent) Run(ctx context.Context) error {
 		}
 		if err := a.persist(); err != nil {
 			fmt.Fprintln(os.Stderr, "warning: failed to persist session:", err)
+		}
+		if err := a.persistTurn(); err != nil {
+			fmt.Fprintln(os.Stderr, "warning: failed to persist turn:", err)
 		}
 	}
 	return nil

@@ -390,6 +390,7 @@ func TestLoopExecutesToolAndResultEntersPayload(t *testing.T) {
 	}}
 
 	a := New(fm, scriptedInput("read the file"), []tool.ToolDefinition{tool.ReadDefinition, tool.EditDefinition, tool.RunDefinition})
+	a.sessionDir = t.TempDir()
 	if err := a.Run(context.Background()); err != nil {
 		t.Fatalf("run: %v", err)
 	}
@@ -415,6 +416,44 @@ func TestFormatRunFileCarriesCommand(t *testing.T) {
 	want := "$ git add .\n> git commit -m x\n\nok\n\ndone\n"
 	if got != want {
 		t.Fatalf("formatRunFile = %q, want %q", got, want)
+	}
+}
+
+func TestTurnFileWrittenWithFrontmatterAndBody(t *testing.T) {
+	fm := &fakeModel{replies: []*anthropic.Message{
+		assistantMessage(t, `{"role":"assistant","content":[{"type":"text","text":"checking"},{"type":"tool_use","id":"c1","name":"run","input":{"command":"echo hi"}}]}`),
+		assistantMessage(t, `{"role":"assistant","content":[{"type":"text","text":"all done"}]}`),
+	}}
+	a := New(fm, scriptedInput("what changed?"), []tool.ToolDefinition{tool.RunDefinition})
+	a.sessionDir = t.TempDir()
+	if err := a.Run(context.Background()); err != nil {
+		t.Fatalf("run: %v", err)
+	}
+
+	// One user exchange => Turn 1; two model responses => Round counter 2.
+	if a.turn != 1 {
+		t.Fatalf("turn = %d, want 1", a.turn)
+	}
+	if a.round != 2 {
+		t.Fatalf("round = %d, want 2", a.round)
+	}
+
+	data, err := os.ReadFile(filepath.Join(a.sessionDir, "turns", "001.md"))
+	if err != nil {
+		t.Fatalf("turn file: %v", err)
+	}
+	s := string(data)
+	// Frontmatter: structure only (per-Round refs; the prose-only round is empty).
+	for _, want := range []string{"turn: 1", "rounds:", `- ["#1"]`, "- []"} {
+		if !strings.Contains(s, want) {
+			t.Fatalf("frontmatter missing %q:\n%s", want, s)
+		}
+	}
+	// Body: readable transcript with the terminal's markers.
+	for _, want := range []string{"❯ what changed?", "⏺ checking", "● run(echo hi)", "⏺ all done"} {
+		if !strings.Contains(s, want) {
+			t.Fatalf("body missing %q:\n%s", want, s)
+		}
 	}
 }
 

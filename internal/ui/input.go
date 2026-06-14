@@ -65,26 +65,36 @@ func readLineRaw() (string, bool) {
 
 	bw := boxWidth()
 	bar := strings.Repeat("─", max(0, bw-2))
-	// A blank line, the Working Set + shortcuts footer, the top border, then the
-	// (empty) prompt row. The footer sits above the box so the in-place line
-	// editor below it can repaint without disturbing it.
+	// Below the prompt row sit the box's bottom border and the Manifest panel (the
+	// collapsed Turns). They are drawn once, then the cursor is moved back up to the
+	// prompt row so the in-place editor repaints only that row, leaving the panel
+	// untouched until the line is submitted.
+	below := append([]string{railSeq + "╰" + bar + "╯" + reset}, manifestPanelLines(bw)...)
+
+	// A blank line, the shortcuts footer, the top border, then the (empty) prompt
+	// row; the footer sits above the box so the editor can repaint without it.
 	fmt.Printf("\r\n%s\r\n%s╭%s╮%s\r\n", statusLine(bw), railSeq, bar, reset)
 	var buf []rune
-	drawInputRow(buf, bw)
+	fmt.Print(inputRow(buf, bw))
+	for _, ln := range below {
+		fmt.Print("\r\n" + ln)
+	}
+	fmt.Printf("\x1b[%dA", len(below)) // back up to the prompt row
+	fmt.Print(inputRow(buf, bw))       // re-park the cursor at the input position
 
 	for {
 		r, _, err := stdin.ReadRune()
 		if err != nil {
-			return finish(buf, bw, false)
+			return finish(buf, bw, len(below), false)
 		}
 		switch r {
 		case '\r', '\n': // submit
-			return finish(buf, bw, true)
+			return finish(buf, bw, len(below), true)
 		case 0x03: // Ctrl-C — quit
-			return finish(nil, bw, false)
+			return finish(nil, bw, len(below), false)
 		case 0x04: // Ctrl-D — quit on an empty line
 			if len(buf) == 0 {
-				return finish(nil, bw, false)
+				return finish(nil, bw, len(below), false)
 			}
 		case 0x15: // Ctrl-U — clear the line
 			buf = buf[:0]
@@ -125,24 +135,84 @@ func inputRow(buf []rune, bw int) string {
 		string(buf), strings.Repeat(" ", pad), railSeq, reset, 5+bufW)
 }
 
-// finish closes the box below the prompt row, leaving one blank line before the
-// response, and returns the edited line.
-func finish(buf []rune, bw int, ok bool) (string, bool) {
-	bar := strings.Repeat("─", max(0, bw-2))
-	fmt.Printf("\r\n%s╰%s╯%s\r\n\r\n", railSeq, bar, reset)
+// finish moves the cursor below the box and the Manifest panel (belowCount lines
+// under the prompt row, already drawn), leaving one blank line before the response,
+// and returns the edited line.
+func finish(buf []rune, bw, belowCount int, ok bool) (string, bool) {
+	fmt.Printf("\x1b[%dB\r\n\r\n", belowCount)
 	return string(buf), ok
 }
 
-// statusLine is the dim footer shown above the input box. It surfaces the Manifest
-// size — the collapsed Turns the agent still carries, the thing that sets it apart
-// from a plain chat loop — alongside the key hints, so both stay in view as you type.
+// statusLine is the dim footer shown above the input box: just the key hints now.
+// The Manifest itself is rendered as its own panel below the box (manifestPanelLines).
 func statusLine(bw int) string {
-	parts := make([]string, 0, 3)
-	if manifestCount > 0 {
-		parts = append(parts, fmt.Sprintf("manifest: %d", manifestCount))
+	return metaSeq + " " + strings.Join([]string{"⏎ send", "⌃C quit"}, "   ·   ") + reset
+}
+
+// manifestCap bounds the panel: beyond it, the oldest collapsed Turns fold into a
+// single "… +K earlier turns" line so the freshest stay visible.
+const manifestCap = 8
+
+// manifestPanelLines renders the Manifest — the collapsed Turns the agent still
+// carries — as a full-width box drawn below the input box: a titled top border, one
+// row per Turn ("Turn N  <description>", oldest at top), and a bottom border. It is
+// empty (nil) when nothing has collapsed, and capped at manifestCap rows.
+func manifestPanelLines(bw int) []string {
+	if len(manifest) == 0 || bw < 8 {
+		return nil
 	}
-	parts = append(parts, "⏎ send", "⌃C quit")
-	return metaSeq + " " + strings.Join(parts, "   ·   ") + reset
+	content := bw - 4 // "│ " + content + " │"
+
+	title := fmt.Sprintf("manifest · %d", len(manifest))
+	dashes := max(0, bw-runewidth.StringWidth("╭─ "+title+" ")-1)
+	top := railSeq + "╭─ " + reset + metaSeq + title + reset + " " + railSeq + strings.Repeat("─", dashes) + "╮" + reset
+
+	row := func(visible, styled string) string {
+		pad := max(0, content-runewidth.StringWidth(visible))
+		return railSeq + "│" + reset + " " + styled + strings.Repeat(" ", pad) + " " + railSeq + "│" + reset
+	}
+
+	entries := manifest
+	fold := 0
+	if len(entries) > manifestCap {
+		fold = len(entries) - (manifestCap - 1)
+		entries = entries[len(entries)-(manifestCap-1):]
+	}
+
+	rows := []string{top}
+	if fold > 0 {
+		txt := fmt.Sprintf("… +%d earlier turns", fold)
+		rows = append(rows, row(txt, metaSeq+txt+reset))
+	}
+	for _, e := range entries {
+		label := fmt.Sprintf("Turn %d", e.Turn)
+		const gap = "  "
+		desc := truncateDisplay(strings.ReplaceAll(e.Desc, "\n", " "), max(0, content-runewidth.StringWidth(label)-len(gap)))
+		rows = append(rows, row(label+gap+desc, accentSeq+label+reset+gap+desc))
+	}
+	rows = append(rows, railSeq+"╰"+strings.Repeat("─", max(0, bw-2))+"╯"+reset)
+	return rows
+}
+
+// truncateDisplay clips s to maxW display columns, marking a cut with an ellipsis.
+func truncateDisplay(s string, maxW int) string {
+	if maxW <= 0 {
+		return ""
+	}
+	if runewidth.StringWidth(s) <= maxW {
+		return s
+	}
+	var out []rune
+	w := 0
+	for _, r := range s {
+		rw := runewidth.RuneWidth(r)
+		if w+rw > maxW-1 {
+			break
+		}
+		out = append(out, r)
+		w += rw
+	}
+	return string(out) + "…"
 }
 
 // consumeEscape discards the rest of an escape sequence (e.g. an arrow key)

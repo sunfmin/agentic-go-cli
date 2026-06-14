@@ -278,7 +278,7 @@ func (a *Agent) Run(ctx context.Context) error {
 	readUserInput := true
 	for {
 		if readUserInput {
-			ui.SetManifestCount(a.collapsedTurnCount())
+			ui.SetManifest(a.manifestEntries())
 			userInput, ok := a.getUserMessage()
 			if !ok {
 				break
@@ -535,16 +535,36 @@ func (a *Agent) describe(input []byte) (string, bool) {
 	return fmt.Sprintf("described Turn %d", in.Turn), false
 }
 
-// collapsedTurnCount is how many Turns have collapsed (fallen outside the recent
-// window) and not been forgotten — the size of the Manifest, surfaced in the UI.
-func (a *Agent) collapsedTurnCount() int {
-	n := 0
+// manifestEntries is the Manifest surfaced in the UI panel: one entry per
+// collapsed, non-forgotten Turn, carrying the same Description the payload sends
+// (the upgraded gist, else the prompt's first line). Oldest first.
+func (a *Agent) manifestEntries() []ui.ManifestEntry {
+	var es []ui.ManifestEntry
 	for t := 1; t <= a.turn-fullTurnWindow; t++ {
-		if !a.forgottenTurns[t] {
-			n++
+		if a.forgottenTurns[t] {
+			continue
+		}
+		desc := a.turnDesc[t]
+		if strings.TrimSpace(desc) == "" {
+			desc = firstLine(a.turnPrompt(t))
+		}
+		es = append(es, ui.ManifestEntry{Turn: t, Desc: desc})
+	}
+	return es
+}
+
+// turnPrompt returns the user prompt that opened the given Turn.
+func (a *Agent) turnPrompt(turn int) string {
+	cur := 0
+	for _, e := range a.events {
+		if e.kind == evUser {
+			cur++
+			if cur == turn {
+				return e.text
+			}
 		}
 	}
-	return n
+	return ""
 }
 
 // summarizeCollapsedTurns gives every newly-collapsed Turn that still lacks a

@@ -19,13 +19,13 @@ func capture(t *testing.T, tty bool, width int, fn func()) string {
 	prevOut, prevTTY, prevWidth := out, isTTY, termWidth
 	t.Cleanup(func() {
 		out, isTTY, termWidth = prevOut, prevTTY, prevWidth
-		railOpen, manifestCount = false, 0
+		railOpen, manifest = false, nil
 	})
 	var buf bytes.Buffer
 	out = &buf
 	isTTY = func() bool { return tty }
 	termWidth = func() int { return width }
-	railOpen, manifestCount = false, 0
+	railOpen, manifest = false, nil
 	fn()
 	return buf.String()
 }
@@ -231,26 +231,85 @@ func TestPrintWelcome(t *testing.T) {
 }
 
 func TestStatusLine(t *testing.T) {
-	tests := []struct {
-		name  string
-		count int
-		want  string
-	}{
-		{name: "empty manifest is omitted", count: 0, want: " ⏎ send   ·   ⌃C quit"},
-		{name: "non-empty manifest is surfaced", count: 2, want: " manifest: 2   ·   ⏎ send   ·   ⌃C quit"},
+	// The footer is just the key hints now; the Manifest moved to its own panel.
+	got := stripANSI(capture(t, true, 80, func() {
+		out.Write([]byte(statusLine(80)))
+	}))
+	want := " ⏎ send   ·   ⌃C quit"
+	if got != want {
+		t.Errorf("statusLine = %q, want %q", got, want)
 	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			// statusLine reads the package-level count; capture resets it after.
-			got := stripANSI(frame(t, 80, func() {
-				SetManifestCount(tt.count)
-				out.Write([]byte(statusLine(80)))
-			}))
-			if got != tt.want {
-				t.Errorf("statusLine(count=%d) = %q, want %q", tt.count, got, tt.want)
+}
+
+func indexOfLine(lines []string, sub string) int {
+	for i, l := range lines {
+		if strings.Contains(l, sub) {
+			return i
+		}
+	}
+	return -1
+}
+
+func TestManifestPanel(t *testing.T) {
+	render := func(entries []ManifestEntry) []string {
+		var lines []string
+		capture(t, true, 60, func() {
+			SetManifest(entries)
+			for _, ln := range manifestPanelLines(60) {
+				lines = append(lines, stripANSI(ln))
 			}
 		})
+		return lines
 	}
+
+	t.Run("empty manifest renders nothing", func(t *testing.T) {
+		if got := render(nil); got != nil {
+			t.Fatalf("empty manifest should render no panel, got %q", got)
+		}
+	})
+
+	t.Run("entries render oldest-first with a titled box", func(t *testing.T) {
+		lines := render([]ManifestEntry{
+			{Turn: 1, Desc: "fixed the parser's trailing comma"},
+			{Turn: 2, Desc: "added table-driven tests"},
+		})
+		joined := strings.Join(lines, "\n")
+		for _, want := range []string{"manifest · 2", "Turn 1", "fixed the parser", "Turn 2", "added table-driven tests"} {
+			if !strings.Contains(joined, want) {
+				t.Fatalf("panel missing %q:\n%s", want, joined)
+			}
+		}
+		// Oldest first: Turn 1's row precedes Turn 2's.
+		if i, j := indexOfLine(lines, "Turn 1"), indexOfLine(lines, "Turn 2"); i < 0 || j < 0 || i > j {
+			t.Fatalf("rows not oldest-first (Turn 1 at %d, Turn 2 at %d)", i, j)
+		}
+		// Every row is the box width (60), borders aligned.
+		for _, ln := range lines {
+			if w := stringWidth([]rune(ln)); w != 60 {
+				t.Fatalf("row width = %d, want 60: %q", w, ln)
+			}
+		}
+	})
+
+	t.Run("overflow folds the oldest into one line", func(t *testing.T) {
+		var entries []ManifestEntry
+		for i := 1; i <= 12; i++ {
+			entries = append(entries, ManifestEntry{Turn: i, Desc: "did a thing"})
+		}
+		lines := render(entries)
+		joined := strings.Join(lines, "\n")
+		// 12 entries, cap 8 → fold the oldest 5 (12-7) and show the freshest 7.
+		if !strings.Contains(joined, "… +5 earlier turns") {
+			t.Fatalf("overflow fold line missing:\n%s", joined)
+		}
+		if !strings.Contains(joined, "Turn 12") || strings.Contains(joined, "Turn 1 ") {
+			t.Fatalf("overflow should drop the oldest, keep the freshest:\n%s", joined)
+		}
+		// Bounded: title + fold + 7 rows + bottom = 10 lines.
+		if len(lines) != 10 {
+			t.Fatalf("overflow panel has %d lines, want 10", len(lines))
+		}
+	})
 }
 
 func TestSplitArgs(t *testing.T) {
@@ -325,7 +384,10 @@ func TestPrintToolResultErrorIsRed(t *testing.T) {
 // image), and asserts the headline elements are present.
 func TestFullReplyFrame(t *testing.T) {
 	joined := strings.Join(richLines(t, 80, func() {
-		SetManifestCount(2)
+		SetManifest([]ManifestEntry{
+			{Turn: 1, Desc: "created hello.txt and confirmed its output"},
+			{Turn: 2, Desc: "added a table-driven test for the greeter"},
+		})
 		PrintWelcome("Opus 4.8 · Claude Code OAuth", "~/dev/agentic-go-cli")
 		PrintHint("Resumed .agentic-artifacts/sessions/20260614-160000  (--new for a fresh session)")
 		PrintAssistant("I'll create hello.txt, then run it to confirm the output.")
@@ -349,11 +411,15 @@ func TestFullReplyFrame(t *testing.T) {
 			railSeq, reset, accentSeq, glyphPrompt, reset,
 			string(buf), strings.Repeat(" ", pad), railSeq, reset)
 		fmt.Fprintf(out, "%s╰%s╯%s\n", railSeq, bar, reset)
+		// The Manifest panel sits below the box, mirroring what the agent still carries.
+		for _, ln := range manifestPanelLines(bw) {
+			fmt.Fprintf(out, "%s\n", ln)
+		}
 	}), "\n")
 
 	for _, want := range []string{
 		"◆ agentic-go-cli", "├─ read", "├─ edit", "├─ run",
-		"◆  Done", "manifest: 2", "› add a goodbye file too",
+		"◆  Done", "manifest · 2", "Turn 1", "created hello.txt", "› add a goodbye file too",
 	} {
 		if !strings.Contains(joined, want) {
 			t.Errorf("full frame is missing %q:\n%s", want, joined)

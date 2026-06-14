@@ -103,12 +103,19 @@ func openRail() {
 
 func closeRail() { railOpen = false }
 
-// manifestCount is the number of collapsed Turns in the Manifest, surfaced under
-// the input box. SetManifestCount is called by the agent before each prompt.
-var manifestCount int
+// ManifestEntry is one collapsed Turn shown in the Manifest panel: its number and
+// the one-line Description that stands in for it.
+type ManifestEntry struct {
+	Turn int
+	Desc string
+}
 
-// SetManifestCount records the Manifest size (collapsed Turns) shown in the footer.
-func SetManifestCount(n int) { manifestCount = n }
+// manifest is the collapsed Turns shown in the panel below the input box, oldest
+// first. SetManifest is called by the agent before each prompt.
+var manifest []ManifestEntry
+
+// SetManifest records the Manifest (collapsed Turns) rendered in the panel.
+func SetManifest(entries []ManifestEntry) { manifest = entries }
 
 // PrintWelcome prints the rounded welcome banner shown once at startup. The same
 // diamond the assistant speaks at opens it, so the banner reads as the agent's

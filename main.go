@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"flag"
 	"fmt"
 	"os"
 	"os/exec"
@@ -16,6 +17,10 @@ import (
 )
 
 func main() {
+	newSession := flag.Bool("new", false, "start a fresh Session instead of resuming the most recent one")
+	resumeID := flag.String("resume", "", "resume a specific Session by id (the sessions/<id> directory name)")
+	flag.Parse()
+
 	token, err := claudeCodeToken()
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "failed to load Claude Code credentials:", err)
@@ -46,6 +51,27 @@ func main() {
 			tool.DescribeDefinition,
 		},
 	)
+
+	// Bare startup resumes the most recent Session; --new opts out; --resume
+	// targets a specific one.
+	switch {
+	case *resumeID != "":
+		dir := filepath.Join(".agentic-artifacts", "sessions", *resumeID)
+		if err := a.Load(dir); err != nil {
+			fmt.Fprintln(os.Stderr, "failed to resume session:", err)
+			os.Exit(1)
+		}
+		fmt.Println("Resumed session", *resumeID)
+	case !*newSession:
+		if dir, ok := agent.MostRecentSession(); ok {
+			if err := a.Load(dir); err != nil {
+				fmt.Fprintln(os.Stderr, "failed to resume session:", err)
+				os.Exit(1)
+			}
+			fmt.Println("Resumed", dir, "(--new for a fresh session)")
+		}
+	}
+
 	if err := a.Run(context.Background()); err != nil {
 		fmt.Fprintln(os.Stderr, "error:", err)
 		os.Exit(1)

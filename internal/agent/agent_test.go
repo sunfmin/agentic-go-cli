@@ -459,6 +459,84 @@ func TestTurnFileWrittenWithFrontmatterAndBody(t *testing.T) {
 	}
 }
 
+// payloadContains reports whether any text or tool_result text in the payload
+// contains sub.
+func payloadContains(payload []anthropic.MessageParam, sub string) bool {
+	for _, m := range payload {
+		for _, b := range m.Content {
+			if b.OfText != nil && strings.Contains(b.OfText.Text, sub) {
+				return true
+			}
+			if b.OfToolResult != nil {
+				for _, c := range b.OfToolResult.Content {
+					if c.OfText != nil && strings.Contains(c.OfText.Text, sub) {
+						return true
+					}
+				}
+			}
+		}
+	}
+	return false
+}
+
+func TestResumeRebuildsPayloadAndContinues(t *testing.T) {
+	dir := t.TempDir()
+
+	// Session 1: a run plus a final answer, then quit.
+	fm1 := &fakeModel{replies: []*anthropic.Message{
+		assistantMessage(t, `{"role":"assistant","content":[{"type":"text","text":"let me check"},{"type":"tool_use","id":"c1","name":"run","input":{"command":"echo hi"}}]}`),
+		assistantMessage(t, `{"role":"assistant","content":[{"type":"text","text":"it said hi"}]}`),
+	}}
+	a1 := New(fm1, scriptedInput("what does echo say?"), []tool.ToolDefinition{tool.RunDefinition})
+	a1.sessionDir = dir
+	if err := a1.Run(context.Background()); err != nil {
+		t.Fatalf("session 1: %v", err)
+	}
+
+	// Resume into a fresh Agent and ask a follow-up.
+	fm2 := &fakeModel{replies: []*anthropic.Message{
+		assistantMessage(t, `{"role":"assistant","content":[{"type":"text","text":"you're welcome"}]}`),
+	}}
+	a2 := New(fm2, scriptedInput("thanks"), []tool.ToolDefinition{tool.RunDefinition})
+	if err := a2.Load(dir); err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if err := a2.Run(context.Background()); err != nil {
+		t.Fatalf("session 2: %v", err)
+	}
+
+	if len(fm2.calls) == 0 {
+		t.Fatal("resumed session made no model call")
+	}
+	sent := fm2.calls[0]
+
+	// The prior conversation and the new prompt are both present.
+	if !payloadContains(sent, "what does echo say?") {
+		t.Fatalf("resumed payload missing the prior prompt")
+	}
+	if !payloadContains(sent, "thanks") {
+		t.Fatalf("resumed payload missing the new prompt")
+	}
+	// The prior tool exchange is rebuilt with pairing intact (legal request).
+	if !hasToolUse(sent, "c1") {
+		t.Fatalf("resumed payload missing the prior tool_use")
+	}
+	if findToolResult(sent, "c1") == "" {
+		t.Fatalf("resumed payload missing the paired tool_result")
+	}
+	// The Turn counter continued from where Session 1 left off.
+	if a2.turn != 2 {
+		t.Fatalf("turn = %d, want 2 (resumed Turn 1 + one new Turn)", a2.turn)
+	}
+	// It kept writing into the same Session directory.
+	if a2.sessionDir != dir {
+		t.Fatalf("resumed session dir = %q, want %q", a2.sessionDir, dir)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "turns", "002.md")); err != nil {
+		t.Fatalf("new Turn not persisted into the resumed Session: %v", err)
+	}
+}
+
 func TestNewSessionDirsDoNotClobber(t *testing.T) {
 	t.Chdir(t.TempDir())
 	d1, err := newSessionDir()

@@ -56,6 +56,9 @@ func (a *Agent) Load(dir string) error {
 	if idx.Turns != nil {
 		a.turnDesc = idx.Turns
 	}
+	if idx.Forgotten != nil {
+		a.forgottenTurns = idx.Forgotten
+	}
 
 	for _, e := range idx.Entries {
 		en := &entry{

@@ -19,13 +19,13 @@ func capture(t *testing.T, tty bool, width int, fn func()) string {
 	prevOut, prevTTY, prevWidth := out, isTTY, termWidth
 	t.Cleanup(func() {
 		out, isTTY, termWidth = prevOut, prevTTY, prevWidth
-		railOpen, workingSetCount = false, 0
+		railOpen, manifestCount = false, 0
 	})
 	var buf bytes.Buffer
 	out = &buf
 	isTTY = func() bool { return tty }
 	termWidth = func() int { return width }
-	railOpen, workingSetCount = false, 0
+	railOpen, manifestCount = false, 0
 	fn()
 	return buf.String()
 }
@@ -236,14 +236,14 @@ func TestStatusLine(t *testing.T) {
 		count int
 		want  string
 	}{
-		{name: "empty working set is omitted", count: 0, want: " ⏎ send   ·   ⌃C quit"},
-		{name: "non-empty working set is surfaced", count: 2, want: " working set: 2   ·   ⏎ send   ·   ⌃C quit"},
+		{name: "empty manifest is omitted", count: 0, want: " ⏎ send   ·   ⌃C quit"},
+		{name: "non-empty manifest is surfaced", count: 2, want: " manifest: 2   ·   ⏎ send   ·   ⌃C quit"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			// statusLine reads the package-level count; capture resets it after.
 			got := stripANSI(frame(t, 80, func() {
-				SetWorkingSet(tt.count)
+				SetManifestCount(tt.count)
 				out.Write([]byte(statusLine(80)))
 			}))
 			if got != tt.want {
@@ -325,7 +325,7 @@ func TestPrintToolResultErrorIsRed(t *testing.T) {
 // image), and asserts the headline elements are present.
 func TestFullReplyFrame(t *testing.T) {
 	joined := strings.Join(richLines(t, 80, func() {
-		SetWorkingSet(2)
+		SetManifestCount(2)
 		PrintWelcome("Opus 4.8 · Claude Code OAuth", "~/dev/agentic-go-cli")
 		PrintHint("Resumed .agentic-artifacts/sessions/20260614-160000  (--new for a fresh session)")
 		PrintAssistant("I'll create hello.txt, then run it to confirm the output.")
@@ -353,7 +353,7 @@ func TestFullReplyFrame(t *testing.T) {
 
 	for _, want := range []string{
 		"◆ agentic-go-cli", "├─ read", "├─ edit", "├─ run",
-		"◆  Done", "working set: 2", "› add a goodbye file too",
+		"◆  Done", "manifest: 2", "› add a goodbye file too",
 	} {
 		if !strings.Contains(joined, want) {
 			t.Errorf("full frame is missing %q:\n%s", want, joined)

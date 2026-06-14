@@ -133,13 +133,13 @@ func finish(buf []rune, bw int, ok bool) (string, bool) {
 	return string(buf), ok
 }
 
-// statusLine is the dim footer shown above the input box. It surfaces the live
-// Working Set size — the thing that sets this agent apart from a plain chat loop —
-// alongside the key hints, so both stay in view while you type.
+// statusLine is the dim footer shown above the input box. It surfaces the Manifest
+// size — the collapsed Turns the agent still carries, the thing that sets it apart
+// from a plain chat loop — alongside the key hints, so both stay in view as you type.
 func statusLine(bw int) string {
 	parts := make([]string, 0, 3)
-	if workingSetCount > 0 {
-		parts = append(parts, fmt.Sprintf("working set: %d", workingSetCount))
+	if manifestCount > 0 {
+		parts = append(parts, fmt.Sprintf("manifest: %d", manifestCount))
 	}
 	parts = append(parts, "⏎ send", "⌃C quit")
 	return metaSeq + " " + strings.Join(parts, "   ·   ") + reset

@@ -19,15 +19,16 @@ const (
 // indexState is the on-disk form of the Working Set plus the counters and a
 // little session metadata. It is rewritten in full each Round (temp + rename).
 type indexState struct {
-	Schema      int          `json:"schema"`
-	CreatedAt   string       `json:"created_at,omitempty"`
-	Model       string       `json:"model,omitempty"`
-	Turn        int          `json:"turn"`
-	Round       int          `json:"round"`
+	Schema      int            `json:"schema"`
+	CreatedAt   string         `json:"created_at,omitempty"`
+	Model       string         `json:"model,omitempty"`
+	Turn        int            `json:"turn"`
+	Round       int            `json:"round"`
 	RefSeq      int            `json:"ref_seq"`
 	ArtifactSeq int            `json:"artifact_seq"`
 	Entries     []entryIndex   `json:"entries"`
-	Turns       map[int]string `json:"turns,omitempty"` // upgraded collapsed-Turn descriptions, by turn number
+	Turns       map[int]string `json:"turns,omitempty"`           // collapsed-Turn descriptions, by turn number
+	Forgotten   map[int]bool   `json:"forgotten_turns,omitempty"` // collapsed Turns the model has forgotten
 }
 
 // entryIndex is one Working Set entry without its content: the content is
@@ -81,6 +82,9 @@ func (a *Agent) indexState() indexState {
 	}
 	if len(a.turnDesc) > 0 {
 		st.Turns = a.turnDesc
+	}
+	if len(a.forgottenTurns) > 0 {
+		st.Forgotten = a.forgottenTurns
 	}
 	for _, id := range a.ws.order {
 		en := a.ws.byID[id]

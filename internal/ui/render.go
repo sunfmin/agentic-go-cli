@@ -103,12 +103,12 @@ func openRail() {
 
 func closeRail() { railOpen = false }
 
-// workingSetCount is the live Working Set size, surfaced under the input box.
-// SetWorkingSet is called by the agent before each prompt.
-var workingSetCount int
+// manifestCount is the number of collapsed Turns in the Manifest, surfaced under
+// the input box. SetManifestCount is called by the agent before each prompt.
+var manifestCount int
 
-// SetWorkingSet records the live Working Set size shown in the input footer.
-func SetWorkingSet(n int) { workingSetCount = n }
+// SetManifestCount records the Manifest size (collapsed Turns) shown in the footer.
+func SetManifestCount(n int) { manifestCount = n }
 
 // PrintWelcome prints the rounded welcome banner shown once at startup. The same
 // diamond the assistant speaks at opens it, so the banner reads as the agent's

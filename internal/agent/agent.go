@@ -140,24 +140,20 @@ func newEntry(id, toolName string, input []byte, content string, isErr bool, tur
 	return e
 }
 
-// manifestLine is the one-line form sent in place of full content once this entry
-// is no longer the latest result. A read renders as a live reference (no content),
-// so the model never reasons against a stale copy.
-func (e *entry) manifestLine() string {
-	prefix := ""
-	if e.ref != "" {
-		prefix = e.ref + " "
-	}
+// collapsedResult is the self-contained one-liner that stands in for a superseded
+// in-window tool result. A read renders as a live reference (no content), so the
+// model never reasons against a stale copy; a run points at its recallable output.
+func (e *entry) collapsedResult() string {
 	switch e.kind {
 	case kindRead:
-		return fmt.Sprintf("[%sread %s @turn %d — re-read for current contents]", prefix, e.path, e.turn)
+		return fmt.Sprintf("[read %s @turn %d — re-read for current contents]", e.path, e.turn)
 	case kindRun:
 		if e.path != "" {
-			return fmt.Sprintf("[%s%s — recall: read %s]", prefix, e.desc, e.path)
+			return fmt.Sprintf("[%s — recall: read %s]", e.desc, e.path)
 		}
-		return fmt.Sprintf("[%s%s]", prefix, e.desc)
+		return fmt.Sprintf("[%s]", e.desc)
 	}
-	return fmt.Sprintf("[%s%s — %s]", prefix, e.name, e.desc)
+	return fmt.Sprintf("[%s — %s]", e.name, e.desc)
 }
 
 // workingSet holds the live entries, keyed by tool_use ID and kept in insertion
@@ -180,18 +176,6 @@ func (w *workingSet) put(e *entry) {
 
 func (w *workingSet) get(id string) *entry {
 	return w.byID[id]
-}
-
-// liveCount is the number of entries still in the Working Set — those not yet
-// forgotten. It is surfaced in the input footer.
-func (w *workingSet) liveCount() int {
-	n := 0
-	for _, id := range w.order {
-		if !w.byID[id].forgotten {
-			n++
-		}
-	}
-	return n
 }
 
 func (w *workingSet) getByRef(ref string) *entry {
@@ -226,11 +210,12 @@ type Agent struct {
 	getUserMessage func() (string, bool)
 	tools          []tool.ToolDefinition
 
-	events   []event
-	ws       *workingSet
-	turn     int            // Turn: one user prompt plus the entire AI reply that follows
-	round    int            // Round: one model response within a Turn
-	turnDesc map[int]string // upgraded one-line Descriptions for collapsed Turns, by turn number
+	events         []event
+	ws             *workingSet
+	turn           int            // Turn: one user prompt plus the entire AI reply that follows
+	round          int            // Round: one model response within a Turn
+	turnDesc       map[int]string // one-line Descriptions for collapsed Turns, by turn number
+	forgottenTurns map[int]bool   // collapsed Turns the model has forgotten, by turn number
 
 	sessionDir  string // this Session's on-disk directory; created lazily
 	createdAt   string // RFC3339 timestamp recorded in the index, set on first persist
@@ -246,6 +231,7 @@ func New(model Model, getUserMessage func() (string, bool), tools []tool.ToolDef
 		tools:          tools,
 		ws:             newWorkingSet(),
 		turnDesc:       map[int]string{},
+		forgottenTurns: map[int]bool{},
 	}
 }
 
@@ -253,7 +239,7 @@ func (a *Agent) Run(ctx context.Context) error {
 	readUserInput := true
 	for {
 		if readUserInput {
-			ui.SetWorkingSet(a.ws.liveCount())
+			ui.SetManifestCount(a.collapsedTurnCount())
 			userInput, ok := a.getUserMessage()
 			if !ok {
 				break
@@ -262,7 +248,7 @@ func (a *Agent) Run(ctx context.Context) error {
 			a.events = append(a.events, event{kind: evUser, text: userInput})
 		}
 
-		message, err := a.model.Next(ctx, buildPayload(a.events, a.ws, a.turnDesc), a.toolParams())
+		message, err := a.model.Next(ctx, buildPayload(a.events, a.ws, a.turnDesc, a.forgottenTurns), a.toolParams())
 		if err != nil {
 			return err
 		}
@@ -299,11 +285,14 @@ func (a *Agent) Run(ctx context.Context) error {
 	return nil
 }
 
-// buildPayload reconstructs the messages to send to the model from the event log
-// and the working set. Only the most recent tool result is sent in full; every
-// older tool result collapses to its one-line Manifest entry, while keeping the
-// tool_use/tool_result pairing intact so the request stays valid.
-func buildPayload(events []event, ws *workingSet, turnDesc map[int]string) []anthropic.MessageParam {
+// buildPayload reconstructs the messages to send to the model from the event log.
+// Recent Turns are sent in full; every older Turn collapses to a one-line synopsis
+// (its tool calls folding in), and a forgotten collapsed Turn is dropped entirely.
+// Within the recent window the latest tool result is full and superseded results
+// collapse to a self-contained one-liner, keeping tool_use/tool_result pairing
+// intact so the request stays valid. There is no standalone Manifest block: the
+// Manifest is exactly the collapsed-Turn synopses, woven in where the Turns sat.
+func buildPayload(events []event, ws *workingSet, turnDesc map[int]string, forgotten map[int]bool) []anthropic.MessageParam {
 	// The latest results are full only when they are literally the last thing in
 	// the log — i.e. the model is about to respond to them. Once a user or
 	// assistant turn follows, they too collapse into the Manifest.
@@ -317,10 +306,14 @@ func buildPayload(events []event, ws *workingSet, turnDesc map[int]string) []ant
 			curTurn++
 		}
 		// Turns older than the most recent few collapse to a one-line synopsis,
-		// and their tool_use/tool_result plumbing is dropped wholesale. The live
-		// Artifacts they produced stay listed in the Manifest, recallable, and
-		// the full exchange is recalled by reading the Turn's transcript.
+		// their tool_use/tool_result plumbing dropped wholesale and their tool
+		// calls folding into the synopsis; the full exchange is recalled by
+		// reading the Turn's transcript. A forgotten collapsed Turn is dropped
+		// entirely — prompt and synopsis both.
 		if curTurn <= totalTurns-fullTurnWindow {
+			if forgotten[curTurn] {
+				continue
+			}
 			if e.kind == evUser {
 				out = append(out, anthropic.NewUserMessage(anthropic.NewTextBlock(e.text)))
 				out = append(out, anthropic.NewAssistantMessage(anthropic.NewTextBlock(turnSynopsis(curTurn, e.text, turnDesc))))
@@ -360,9 +353,10 @@ func buildPayload(events []event, ws *workingSet, turnDesc map[int]string) []ant
 				if latest[id] {
 					blocks = append(blocks, anthropic.NewToolResultBlock(id, en.content, en.isErr))
 				} else {
-					// The description has moved to the standalone Manifest; the
-					// result position keeps only a pointer so pairing stays valid.
-					blocks = append(blocks, anthropic.NewToolResultBlock(id, collapsedPointer(en), false))
+					// A superseded in-window result collapses to a self-contained
+					// one-liner in place — enough to know what it was, recallable
+					// from the live file or the Turn's transcript.
+					blocks = append(blocks, anthropic.NewToolResultBlock(id, en.collapsedResult(), false))
 				}
 			}
 			if len(blocks) > 0 {
@@ -371,16 +365,6 @@ func buildPayload(events []event, ws *workingSet, turnDesc map[int]string) []ant
 		}
 	}
 
-	// The Manifest is its own always-current section rather than woven into the
-	// tool_result positions. Attach it to the active prompt (the last message is
-	// always a user message when the model is about to respond).
-	if mani := manifestText(ws, latest, totalTurns); mani != "" {
-		if n := len(out); n > 0 && out[n-1].Role == anthropic.MessageParamRoleUser {
-			out[n-1].Content = append(out[n-1].Content, anthropic.NewTextBlock(mani))
-		} else {
-			out = append(out, anthropic.NewUserMessage(anthropic.NewTextBlock(mani)))
-		}
-	}
 	return out
 }
 
@@ -435,33 +419,6 @@ func latestIDs(events []event) map[string]bool {
 	return latest
 }
 
-// collapsedPointer is the minimal content left in a collapsed result's
-// tool_result position — just enough to point at its Manifest entry.
-func collapsedPointer(en *entry) string {
-	if en.ref != "" {
-		return en.ref + " (see Working Set)"
-	}
-	return "(see Working Set)"
-}
-
-// manifestText renders the standalone Manifest: one line per live, non-latest
-// entry, by which the model decides whether to recall an entry's full content.
-func manifestText(ws *workingSet, latest map[string]bool, curTurn int) string {
-	var lines []string
-	for _, id := range ws.order {
-		en := ws.byID[id]
-		if en.forgotten || latest[id] {
-			continue
-		}
-		lines = append(lines, en.manifestLine())
-	}
-	if len(lines) == 0 {
-		return ""
-	}
-	header := fmt.Sprintf("Working Set (you are on Turn %d; describe a Turn by its number to improve its collapsed synopsis) — recall an entry by reading its file:\n", curTurn)
-	return header + strings.Join(lines, "\n")
-}
-
 func (a *Agent) toolParams() []anthropic.ToolUnionParam {
 	tools := []anthropic.ToolUnionParam{}
 	for _, t := range a.tools {
@@ -505,46 +462,49 @@ func (a *Agent) runTool(name string, input []byte) (string, bool) {
 	return "tool not found: " + name, true
 }
 
-// forget marks the entry with the given Manifest reference as forgotten, so
-// buildPayload drops both its tool_use and tool_result from later payloads.
+// forget drops a collapsed Turn from the Manifest by its number, so buildPayload
+// stops sending its synopsis at all. Only collapsed Turns can be forgotten.
 func (a *Agent) forget(input []byte) (string, bool) {
 	var in struct {
-		Ref string `json:"ref"`
+		Turn int `json:"turn"`
 	}
 	if err := json.Unmarshal(input, &in); err != nil {
 		return err.Error(), true
 	}
-	en := a.ws.getByRef(in.Ref)
-	if en == nil {
-		return "no entry with reference " + in.Ref, true
+	if in.Turn <= 0 {
+		return "forget requires a turn number", true
 	}
-	en.forgotten = true
-	return "forgot " + in.Ref, false
+	a.forgottenTurns[in.Turn] = true
+	return fmt.Sprintf("forgot Turn %d", in.Turn), false
 }
 
-// describe attaches a one-line gist to an entry, replacing its Manifest
-// Description (for a run Artifact, the bare command label until then).
+// describe upgrades a collapsed Turn's one-line Description, so its synopsis reads
+// better than the prompt's first line.
 func (a *Agent) describe(input []byte) (string, bool) {
 	var in struct {
-		Ref  string `json:"ref"`
 		Turn int    `json:"turn"`
 		Gist string `json:"gist"`
 	}
 	if err := json.Unmarshal(input, &in); err != nil {
 		return err.Error(), true
 	}
-	// A Turn target upgrades that Turn's collapsed synopsis; a ref target
-	// upgrades a Working Set entry's Manifest Description.
-	if in.Turn > 0 {
-		a.turnDesc[in.Turn] = in.Gist
-		return fmt.Sprintf("described Turn %d", in.Turn), false
+	if in.Turn <= 0 {
+		return "describe requires a turn number", true
 	}
-	en := a.ws.getByRef(in.Ref)
-	if en == nil {
-		return "no entry with reference " + in.Ref, true
+	a.turnDesc[in.Turn] = in.Gist
+	return fmt.Sprintf("described Turn %d", in.Turn), false
+}
+
+// collapsedTurnCount is how many Turns have collapsed (fallen outside the recent
+// window) and not been forgotten — the size of the Manifest, surfaced in the UI.
+func (a *Agent) collapsedTurnCount() int {
+	n := 0
+	for t := 1; t <= a.turn-fullTurnWindow; t++ {
+		if !a.forgottenTurns[t] {
+			n++
+		}
 	}
-	en.desc = in.Gist
-	return "described " + in.Ref, false
+	return n
 }
 
 // record classifies a tool result into a working-set entry. A run's output is

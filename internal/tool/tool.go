@@ -75,41 +75,39 @@ var EditDefinition = ToolDefinition{
 	},
 }
 
-// ForgetDefinition lets the model drop an entry from the working set. It is
-// declared here for its schema, but the agent intercepts and handles it (it
-// needs to mutate working-set state), so this Function is never called.
+// ForgetDefinition lets the model drop a collapsed Turn from the Manifest. It is
+// declared here for its schema, but the agent intercepts and handles it (it needs
+// to mutate Manifest state), so this Function is never called.
 var ForgetDefinition = ToolDefinition{
 	Name: "forget",
-	Description: "Drop an entry from the working set by its Manifest reference (the #N shown in a " +
-		"collapsed entry). Use it to discard output you no longer need so it stops taking room.",
+	Description: "Drop a collapsed Turn from the Manifest by its number (the N in a collapsed " +
+		"\"[Turn N — …]\" line), so its synopsis stops being sent and you reclaim the room. Only " +
+		"collapsed Turns can be forgotten — the recent Turns sent in full are still active context.",
 	InputSchema: anthropic.ToolInputSchemaParam{
 		Properties: map[string]any{
-			"ref": map[string]any{"type": "string", "description": "The #N reference of the entry to forget, as shown in the Manifest."},
+			"turn": map[string]any{"type": "integer", "description": "The number of the collapsed Turn to forget."},
 		},
-		Required: []string{"ref"},
+		Required: []string{"turn"},
 	},
 	Function: func(input []byte) (string, error) {
 		return "", fmt.Errorf("forget is handled by the agent")
 	},
 }
 
-// DescribeDefinition lets the model attach a one-line gist to a run Artifact so
-// its Manifest entry says what the output was, not just which command ran. Like
-// forget, it is intercepted and handled by the agent; this Function is never
+// DescribeDefinition lets the model upgrade a collapsed Turn's one-line synopsis.
+// Like forget, it is intercepted and handled by the agent; this Function is never
 // called.
 var DescribeDefinition = ToolDefinition{
 	Name: "describe",
-	Description: "Attach a one-line gist as a Description. Target either a Working Set entry by its " +
-		"Manifest reference (ref: the #N), summarizing what a run produced (e.g. \"go test: 3 failures in " +
-		"store\"), or a past Turn by its number (turn: N), summarizing the outcome of that whole exchange so " +
-		"its collapsed synopsis reads better than the prompt's first line. Give exactly one of ref or turn.",
+	Description: "Attach a one-line gist to a past Turn (turn: N), summarizing the outcome of that whole " +
+		"exchange (e.g. \"fixed the CJK width bug in the input editor\") so its collapsed synopsis reads " +
+		"better than the prompt's first line.",
 	InputSchema: anthropic.ToolInputSchemaParam{
 		Properties: map[string]any{
-			"ref":  map[string]any{"type": "string", "description": "The #N reference of the Working Set entry to describe."},
-			"turn": map[string]any{"type": "integer", "description": "The number of the Turn to describe (as shown in a collapsed synopsis or the Working Set header)."},
-			"gist": map[string]any{"type": "string", "description": "A one-line summary."},
+			"turn": map[string]any{"type": "integer", "description": "The number of the Turn to describe (as shown in a collapsed \"[Turn N — …]\" synopsis)."},
+			"gist": map[string]any{"type": "string", "description": "A one-line summary of the Turn's outcome."},
 		},
-		Required: []string{"gist"},
+		Required: []string{"turn", "gist"},
 	},
 	Function: func(input []byte) (string, error) {
 		return "", fmt.Errorf("describe is handled by the agent")

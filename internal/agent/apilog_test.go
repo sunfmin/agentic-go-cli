@@ -171,6 +171,8 @@ func (c *capturingModel) Next(context.Context, []anthropic.MessageParam, []anthr
 	return &anthropic.Message{}, nil
 }
 
+func (c *capturingModel) Summarize(context.Context, string) (string, error) { return "", nil }
+
 func (c *capturingModel) LastExchange() (request, response []byte) {
 	return c.req, c.resp
 }

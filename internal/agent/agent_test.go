@@ -3,6 +3,7 @@ package agent
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -13,10 +14,14 @@ import (
 )
 
 // fakeModel returns scripted assistant messages and records the payloads it saw,
-// so tests can drive the loop and assert what would be sent to the server.
+// so tests can drive the loop and assert what would be sent to the server. Summarize
+// is scripted separately (summary / summaryErr) and records the inputs it was given.
 type fakeModel struct {
-	replies []*anthropic.Message
-	calls   [][]anthropic.MessageParam
+	replies    []*anthropic.Message
+	calls      [][]anthropic.MessageParam
+	summary    string
+	summaryErr error
+	summarized []string
 }
 
 func (f *fakeModel) Next(ctx context.Context, messages []anthropic.MessageParam, tools []anthropic.ToolUnionParam) (*anthropic.Message, error) {
@@ -24,6 +29,11 @@ func (f *fakeModel) Next(ctx context.Context, messages []anthropic.MessageParam,
 	reply := f.replies[0]
 	f.replies = f.replies[1:]
 	return reply, nil
+}
+
+func (f *fakeModel) Summarize(ctx context.Context, transcript string) (string, error) {
+	f.summarized = append(f.summarized, transcript)
+	return f.summary, f.summaryErr
 }
 
 func assistantMessage(t *testing.T, jsonStr string) *anthropic.Message {
@@ -513,6 +523,74 @@ func TestTurnFileWrittenWithFrontmatterAndBody(t *testing.T) {
 		if !strings.Contains(s, want) {
 			t.Fatalf("body missing %q:\n%s", want, s)
 		}
+	}
+}
+
+func TestSummarizeCollapsedTurnAtCollapse(t *testing.T) {
+	// Three Turns; with the window of 2, Turn 1 collapses on the Turn-3 request and
+	// is gisted by an LLM call whose input carries the tool RESULT, not just the call.
+	fm := &fakeModel{
+		summary: "ran echo, printed hi",
+		replies: []*anthropic.Message{
+			assistantMessage(t, `{"role":"assistant","content":[{"type":"tool_use","id":"c1","name":"run","input":{"command":"echo hi"}}]}`), // Turn 1, Round 1
+			assistantMessage(t, `{"role":"assistant","content":[{"type":"text","text":"done one"}]}`),                                        // Turn 1, Round 2
+			assistantMessage(t, `{"role":"assistant","content":[{"type":"text","text":"two"}]}`),                                             // Turn 2
+			assistantMessage(t, `{"role":"assistant","content":[{"type":"text","text":"three"}]}`),                                           // Turn 3
+		},
+	}
+	a := New(fm, scriptedInput("first question", "second question", "third question"),
+		[]tool.ToolDefinition{tool.RunDefinition})
+	a.sessionDir = t.TempDir()
+	if err := a.Run(context.Background()); err != nil {
+		t.Fatalf("run: %v", err)
+	}
+
+	// The collapsed Turn shows the LLM summary, not the prompt's first line.
+	if a.turnDesc[1] != "ran echo, printed hi" {
+		t.Fatalf("Turn 1 desc = %q, want the LLM summary", a.turnDesc[1])
+	}
+	last := fm.calls[len(fm.calls)-1]
+	if !payloadContains(last, "[Turn 1 — ran echo, printed hi") {
+		t.Fatalf("collapsed Turn 1 should show the LLM summary")
+	}
+	if payloadContains(last, "[Turn 1 — first question") {
+		t.Fatalf("collapsed Turn 1 still shows the prompt bootstrap, not the summary")
+	}
+	// Summarized exactly once (cached across Turn 3's rounds) ...
+	if len(fm.summarized) != 1 {
+		t.Fatalf("summarize called %d times, want 1 (cached)", len(fm.summarized))
+	}
+	// ... and the input it summarized included the tool call AND its result.
+	in := fm.summarized[0]
+	for _, want := range []string{"first question", "echo hi", "Tool result", "hi"} {
+		if !strings.Contains(in, want) {
+			t.Fatalf("summary input missing %q:\n%s", want, in)
+		}
+	}
+}
+
+func TestSummarizeFallsBackToBootstrapOnError(t *testing.T) {
+	fm := &fakeModel{
+		summaryErr: errors.New("summary unavailable"),
+		replies: []*anthropic.Message{
+			assistantMessage(t, `{"role":"assistant","content":[{"type":"text","text":"one"}]}`),
+			assistantMessage(t, `{"role":"assistant","content":[{"type":"text","text":"two"}]}`),
+			assistantMessage(t, `{"role":"assistant","content":[{"type":"text","text":"three"}]}`),
+		},
+	}
+	a := New(fm, scriptedInput("first question", "second question", "third question"),
+		[]tool.ToolDefinition{tool.RunDefinition})
+	a.sessionDir = t.TempDir()
+	if err := a.Run(context.Background()); err != nil {
+		t.Fatalf("run must not fail when the summary call errors: %v", err)
+	}
+
+	if a.turnDesc[1] != "" {
+		t.Fatalf("a failed summary should leave no Description, got %q", a.turnDesc[1])
+	}
+	last := fm.calls[len(fm.calls)-1]
+	if !payloadContains(last, "[Turn 1 — first question") {
+		t.Fatalf("collapsed Turn 1 should fall back to the prompt's first line")
 	}
 }
 

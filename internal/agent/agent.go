@@ -25,9 +25,12 @@ import (
 const defaultModel = anthropic.ModelClaudeOpus4_8
 
 // Model is the seam over the Anthropic Messages API so the agent loop can be
-// driven by a scripted fake in tests.
+// driven by a scripted fake in tests. Summarize is a separate one-shot call used
+// to gist a Turn at collapse time (ADR-0006), kept off Next so it neither consumes
+// the main conversation nor shows up in the loop's request log.
 type Model interface {
 	Next(ctx context.Context, messages []anthropic.MessageParam, tools []anthropic.ToolUnionParam) (*anthropic.Message, error)
+	Summarize(ctx context.Context, transcript string) (string, error)
 }
 
 type anthropicModel struct {
@@ -86,6 +89,40 @@ func (m *anthropicModel) capture(req *http.Request, next option.MiddlewareNext) 
 // Next call. Either may be empty if the request never left the client.
 func (m *anthropicModel) LastExchange() (request, response []byte) {
 	return m.lastReq, m.lastResp
+}
+
+// Summarize gists one Turn's transcript into a single outcome-focused line. It is
+// a plain one-shot request — no tools, no capture middleware (so it doesn't clobber
+// the main exchange the agent persists), and a tight token budget.
+func (m *anthropicModel) Summarize(ctx context.Context, transcript string) (string, error) {
+	msg, err := m.client.Messages.New(ctx, anthropic.MessageNewParams{
+		Model:     defaultModel,
+		MaxTokens: 256,
+		System: []anthropic.TextBlockParam{
+			{Text: "You are Claude Code, Anthropic's official CLI for Claude."},
+		},
+		Messages: []anthropic.MessageParam{
+			anthropic.NewUserMessage(anthropic.NewTextBlock(summaryPrompt(transcript))),
+		},
+	})
+	if err != nil {
+		return "", err
+	}
+	var b strings.Builder
+	for _, blk := range msg.Content {
+		if t, ok := blk.AsAny().(anthropic.TextBlock); ok {
+			b.WriteString(t.Text)
+		}
+	}
+	return strings.TrimSpace(b.String()), nil
+}
+
+// summaryPrompt asks for the gist that stands in for a collapsed Turn: its outcome,
+// not the request, in one line the model can scan to decide whether to recall it.
+func summaryPrompt(transcript string) string {
+	return "Summarize this Turn of a coding session in ONE concise line — the outcome " +
+		"and any key facts a future you would need to continue, not the original request. " +
+		"Reply with only that line, no preamble.\n\n" + transcript
 }
 
 // entryKind distinguishes how a tool result is held and rendered when collapsed.
@@ -216,6 +253,7 @@ type Agent struct {
 	round          int            // Round: one model response within a Turn
 	turnDesc       map[int]string // one-line Descriptions for collapsed Turns, by turn number
 	forgottenTurns map[int]bool   // collapsed Turns the model has forgotten, by turn number
+	summaryTried   map[int]bool   // collapsed Turns whose LLM summary has been attempted this session
 
 	sessionDir  string // this Session's on-disk directory; created lazily
 	createdAt   string // RFC3339 timestamp recorded in the index, set on first persist
@@ -232,6 +270,7 @@ func New(model Model, getUserMessage func() (string, bool), tools []tool.ToolDef
 		ws:             newWorkingSet(),
 		turnDesc:       map[int]string{},
 		forgottenTurns: map[int]bool{},
+		summaryTried:   map[int]bool{},
 	}
 }
 
@@ -248,6 +287,7 @@ func (a *Agent) Run(ctx context.Context) error {
 			a.events = append(a.events, event{kind: evUser, text: userInput})
 		}
 
+		a.summarizeCollapsedTurns(ctx)
 		message, err := a.model.Next(ctx, buildPayload(a.events, a.ws, a.turnDesc, a.forgottenTurns), a.toolParams())
 		if err != nil {
 			return err
@@ -505,6 +545,85 @@ func (a *Agent) collapsedTurnCount() int {
 		}
 	}
 	return n
+}
+
+// summarizeCollapsedTurns gives every newly-collapsed Turn that still lacks a
+// Description an LLM-generated one (ADR-0006), at the moment it falls outside the
+// recent window — when its detail is about to be dropped. Each Turn is attempted
+// once per session; a failed or empty summary leaves the Turn to fall back to the
+// prompt's first line, so a collapse never blocks the loop.
+func (a *Agent) summarizeCollapsedTurns(ctx context.Context) {
+	for t := 1; t <= a.turn-fullTurnWindow; t++ {
+		if a.summaryTried[t] || a.forgottenTurns[t] {
+			continue
+		}
+		a.summaryTried[t] = true
+		if strings.TrimSpace(a.turnDesc[t]) != "" {
+			continue // already described (by the model, or restored on resume)
+		}
+		input := a.turnSummaryInput(t)
+		if input == "" {
+			continue
+		}
+		gist, err := a.model.Summarize(ctx, input)
+		if err != nil || strings.TrimSpace(gist) == "" {
+			continue // fall back to the prompt's first line
+		}
+		a.turnDesc[t] = strings.TrimSpace(gist)
+	}
+}
+
+// turnSummaryInput renders one Turn for summarization: its prompt, the assistant's
+// prose, and each tool call paired with its full result — so the gist reflects what
+// the tools produced, not just that they ran. Long results are truncated to keep
+// the summary request bounded.
+func (a *Agent) turnSummaryInput(turn int) string {
+	var b strings.Builder
+	cur := 0
+	for _, e := range a.events {
+		if e.kind == evUser {
+			cur++
+		}
+		if cur != turn {
+			continue
+		}
+		switch e.kind {
+		case evUser:
+			b.WriteString("User: " + e.text + "\n\n")
+		case evAssistant:
+			if e.asst == nil {
+				continue
+			}
+			for _, blk := range e.asst.Content {
+				switch v := blk.AsAny().(type) {
+				case anthropic.TextBlock:
+					if strings.TrimSpace(v.Text) != "" {
+						b.WriteString("Assistant: " + v.Text + "\n\n")
+					}
+				case anthropic.ToolUseBlock:
+					b.WriteString("Tool call: " + v.Name + " " + shortInput(v.Input) + "\n")
+				}
+			}
+		case evToolResults:
+			for _, id := range e.ids {
+				en := a.ws.get(id)
+				if en == nil {
+					continue
+				}
+				b.WriteString(fmt.Sprintf("Tool result (%s):\n%s\n\n", en.name, truncate(en.content, 4000)))
+			}
+		}
+	}
+	return strings.TrimSpace(b.String())
+}
+
+// truncate caps a tool result at max runes for the summary input, marking the cut.
+func truncate(s string, max int) string {
+	r := []rune(s)
+	if len(r) <= max {
+		return s
+	}
+	return string(r[:max]) + "\n… (truncated)"
 }
 
 // record classifies a tool result into a working-set entry. A run's output is

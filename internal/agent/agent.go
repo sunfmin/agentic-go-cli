@@ -8,6 +8,8 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
+	"time"
 
 	"github.com/anthropics/anthropic-sdk-go"
 	"github.com/sunfmin/agentic-go-cli/internal/tool"
@@ -173,9 +175,9 @@ type Agent struct {
 	ws     *workingSet
 	turn   int
 
-	artifactsDir string // where run Artifacts are persisted; created lazily
-	artifactSeq  int
-	refSeq       int
+	sessionDir  string // this Session's on-disk directory; created lazily
+	artifactSeq int
+	refSeq      int
 }
 
 // New builds an agent over a model, an input source, and a set of tools.
@@ -380,40 +382,90 @@ func (a *Agent) record(id, toolName string, input []byte, content string, isErr 
 	a.refSeq++
 	e.ref = fmt.Sprintf("#%d", a.refSeq)
 	if e.kind == kindRun {
-		if p, err := a.writeArtifact(content); err == nil {
+		var in struct {
+			Command string `json:"command"`
+		}
+		_ = json.Unmarshal(input, &in)
+		if p, err := a.writeArtifact(in.Command, content); err == nil {
 			e.path = p
 		}
 	}
 	return e
 }
 
-// artifactsDirName is the directory, relative to the working directory, where
-// run Artifacts are persisted.
-const artifactsDirName = ".agentic-artifacts"
+// artifactsRoot is the gitignored root, relative to the working directory, under
+// which every Session's directory is created.
+const (
+	artifactsRoot  = ".agentic-artifacts"
+	sessionsSubdir = "sessions"
+)
 
-// ensureDir lazily creates the agent's on-disk state directory (a fixed
-// subdirectory of the working directory) and returns its path.
+// ensureDir lazily creates this Session's on-disk directory
+// (.agentic-artifacts/sessions/<timestamp>/) and returns its path.
 func (a *Agent) ensureDir() (string, error) {
-	if a.artifactsDir == "" {
-		if err := os.MkdirAll(artifactsDirName, 0o755); err != nil {
+	if a.sessionDir == "" {
+		dir, err := newSessionDir()
+		if err != nil {
 			return "", err
 		}
-		a.artifactsDir = artifactsDirName
+		a.sessionDir = dir
 	}
-	return a.artifactsDir, nil
+	return a.sessionDir, nil
 }
 
-// writeArtifact persists content to a new file in the state directory and
-// returns its path.
-func (a *Agent) writeArtifact(content string) (string, error) {
+// newSessionDir creates a fresh per-Session directory named by the startup
+// timestamp (lexicographically sortable), disambiguating same-second collisions.
+func newSessionDir() (string, error) {
+	base := filepath.Join(artifactsRoot, sessionsSubdir)
+	id := time.Now().Format("20060102-150405")
+	dir := filepath.Join(base, id)
+	for i := 2; ; i++ {
+		if _, err := os.Stat(dir); os.IsNotExist(err) {
+			break
+		}
+		dir = filepath.Join(base, fmt.Sprintf("%s-%d", id, i))
+	}
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return "", err
+	}
+	return dir, nil
+}
+
+// writeArtifact persists a run's command and output together to a new
+// runs/NNN.txt file in the Session directory and returns its path.
+func (a *Agent) writeArtifact(command, output string) (string, error) {
 	dir, err := a.ensureDir()
 	if err != nil {
 		return "", err
 	}
+	runsDir := filepath.Join(dir, "runs")
+	if err := os.MkdirAll(runsDir, 0o755); err != nil {
+		return "", err
+	}
 	a.artifactSeq++
-	p := filepath.Join(dir, fmt.Sprintf("run-%d.txt", a.artifactSeq))
-	if err := os.WriteFile(p, []byte(content), 0o644); err != nil {
+	p := filepath.Join(runsDir, fmt.Sprintf("%03d.txt", a.artifactSeq))
+	if err := os.WriteFile(p, []byte(formatRunFile(command, output)), 0o644); err != nil {
 		return "", err
 	}
 	return p, nil
+}
+
+// formatRunFile renders a run Artifact as its command (shell-prompt style — "$ "
+// for the first line, "> " for continuations) followed by a blank line and the
+// combined output, so the command travels with its result and a reader (or the
+// resume parser) can recover the command from lines until the first unprefixed one.
+func formatRunFile(command, output string) string {
+	var b strings.Builder
+	for i, line := range strings.Split(command, "\n") {
+		if i == 0 {
+			b.WriteString("$ ")
+		} else {
+			b.WriteString("> ")
+		}
+		b.WriteString(line)
+		b.WriteByte('\n')
+	}
+	b.WriteByte('\n')
+	b.WriteString(output)
+	return b.String()
 }

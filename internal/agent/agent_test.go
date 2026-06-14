@@ -161,7 +161,7 @@ func TestLoopCollapsesPriorRunResult(t *testing.T) {
 	}}
 
 	a := New(fm, scriptedInput("go"), []tool.ToolDefinition{tool.ReadDefinition, tool.EditDefinition, tool.RunDefinition})
-	a.artifactsDir = t.TempDir()
+	a.sessionDir = t.TempDir()
 	if err := a.Run(context.Background()); err != nil {
 		t.Fatalf("run: %v", err)
 	}
@@ -184,7 +184,7 @@ func TestRunArtifactStoredAndRecallable(t *testing.T) {
 	}}
 
 	a := New(fm, scriptedInput("run it"), []tool.ToolDefinition{tool.ReadDefinition, tool.EditDefinition, tool.RunDefinition})
-	a.artifactsDir = t.TempDir()
+	a.sessionDir = t.TempDir()
 	if err := a.Run(context.Background()); err != nil {
 		t.Fatalf("run: %v", err)
 	}
@@ -196,12 +196,16 @@ func TestRunArtifactStoredAndRecallable(t *testing.T) {
 	if en.path == "" {
 		t.Fatalf("run entry has no Artifact path")
 	}
+	if dir := filepath.Base(filepath.Dir(en.path)); dir != "runs" {
+		t.Fatalf("artifact stored in %q, want a runs/ dir", dir)
+	}
 	data, err := os.ReadFile(en.path)
 	if err != nil {
 		t.Fatalf("artifact file: %v", err)
 	}
-	if string(data) != "HELLO\n" {
-		t.Fatalf("artifact content = %q, want %q", data, "HELLO\n")
+	// The command travels with its output in the same file.
+	if want := "$ echo HELLO\n\nHELLO\n"; string(data) != want {
+		t.Fatalf("artifact content = %q, want %q", data, want)
 	}
 
 	// Recall without re-running: read the Artifact file via the read tool.
@@ -209,8 +213,8 @@ func TestRunArtifactStoredAndRecallable(t *testing.T) {
 	if err != nil {
 		t.Fatalf("recall: %v", err)
 	}
-	if recalled != "HELLO\n" {
-		t.Fatalf("recalled = %q, want %q", recalled, "HELLO\n")
+	if !strings.Contains(recalled, "$ echo HELLO") || !strings.Contains(recalled, "HELLO\n") {
+		t.Fatalf("recalled = %q, want it to contain the command and its output", recalled)
 	}
 }
 
@@ -272,7 +276,7 @@ func TestLoopDescribeReplacesRunLabelWithGist(t *testing.T) {
 	}}
 
 	a := New(fm, scriptedInput("go"), []tool.ToolDefinition{tool.RunDefinition, tool.ForgetDefinition, tool.DescribeDefinition})
-	a.artifactsDir = t.TempDir()
+	a.sessionDir = t.TempDir()
 	if err := a.Run(context.Background()); err != nil {
 		t.Fatalf("run: %v", err)
 	}
@@ -313,12 +317,12 @@ func TestSessionPersistedToDisk(t *testing.T) {
 	}}
 
 	a := New(fm, scriptedInput("go"), []tool.ToolDefinition{tool.RunDefinition, tool.DescribeDefinition})
-	a.artifactsDir = t.TempDir()
+	a.sessionDir = t.TempDir()
 	if err := a.Run(context.Background()); err != nil {
 		t.Fatalf("run: %v", err)
 	}
 
-	data, err := os.ReadFile(filepath.Join(a.artifactsDir, sessionFileName))
+	data, err := os.ReadFile(filepath.Join(a.sessionDir, sessionFileName))
 	if err != nil {
 		t.Fatalf("session file not written: %v", err)
 	}
@@ -358,7 +362,7 @@ func TestLoopForgetRemovesEntryFromPayload(t *testing.T) {
 	}}
 
 	a := New(fm, scriptedInput("go"), []tool.ToolDefinition{tool.ReadDefinition, tool.EditDefinition, tool.RunDefinition, tool.ForgetDefinition})
-	a.artifactsDir = t.TempDir()
+	a.sessionDir = t.TempDir()
 	if err := a.Run(context.Background()); err != nil {
 		t.Fatalf("run: %v", err)
 	}
@@ -401,5 +405,35 @@ func TestLoopExecutesToolAndResultEntersPayload(t *testing.T) {
 	}
 	if !found {
 		t.Fatalf("second payload is missing the read result content")
+	}
+}
+
+func TestFormatRunFileCarriesCommand(t *testing.T) {
+	// A multi-line command round-trips: "$ " first line, "> " continuations,
+	// a blank line, then the output (which may itself contain blank lines).
+	got := formatRunFile("git add .\ngit commit -m x", "ok\n\ndone\n")
+	want := "$ git add .\n> git commit -m x\n\nok\n\ndone\n"
+	if got != want {
+		t.Fatalf("formatRunFile = %q, want %q", got, want)
+	}
+}
+
+func TestNewSessionDirsDoNotClobber(t *testing.T) {
+	t.Chdir(t.TempDir())
+	d1, err := newSessionDir()
+	if err != nil {
+		t.Fatal(err)
+	}
+	d2, err := newSessionDir()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if d1 == d2 {
+		t.Fatalf("two Sessions share a directory: %q", d1)
+	}
+	for _, d := range []string{d1, d2} {
+		if fi, err := os.Stat(d); err != nil || !fi.IsDir() {
+			t.Fatalf("session dir %q not created", d)
+		}
 	}
 }

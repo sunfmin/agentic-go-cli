@@ -10,7 +10,6 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
-	"time"
 
 	"github.com/anthropics/anthropic-sdk-go"
 	"github.com/anthropics/anthropic-sdk-go/option"
@@ -37,9 +36,10 @@ func main() {
 	}
 
 	agent := &Agent{
-		client:         &client,
+		model:          anthropicModel{client: &client},
 		getUserMessage: getUserMessage,
-		tools:          []ToolDefinition{BashDefinition},
+		tools:          []ToolDefinition{ReadDefinition, EditDefinition, RunDefinition},
+		ws:             newWorkingSet(),
 	}
 	if err := agent.Run(context.Background()); err != nil {
 		fmt.Fprintln(os.Stderr, "error:", err)
@@ -75,110 +75,14 @@ func claudeCodeToken() (string, error) {
 	return creds.ClaudeAiOauth.AccessToken, nil
 }
 
-type Agent struct {
-	client         *anthropic.Client
-	getUserMessage func() (string, bool)
-	tools          []ToolDefinition
-}
-
-func (a *Agent) Run(ctx context.Context) error {
-	conversation := []anthropic.MessageParam{}
-
-	fmt.Println("Chat with Claude (ctrl-c to quit)")
-
-	readUserInput := true
-	for {
-		if readUserInput {
-			fmt.Print("\x1b[2m❯\x1b[0m ")
-			userInput, ok := a.getUserMessage()
-			if !ok {
-				break
-			}
-			conversation = append(conversation, anthropic.NewUserMessage(anthropic.NewTextBlock(userInput)))
-		}
-
-		message, err := a.runInference(ctx, conversation)
-		if err != nil {
-			return err
-		}
-		conversation = append(conversation, message.ToParam())
-
-		toolResults := []anthropic.ContentBlockParamUnion{}
-		for _, block := range message.Content {
-			switch variant := block.AsAny().(type) {
-			case anthropic.TextBlock:
-				fmt.Printf("⏺ %s\n", variant.Text)
-			case anthropic.ToolUseBlock:
-				result := a.executeTool(variant.ID, variant.Name, []byte(variant.JSON.Input.Raw()))
-				toolResults = append(toolResults, result)
-			}
-		}
-		if len(toolResults) == 0 {
-			readUserInput = true
-			continue
-		}
-		readUserInput = false
-		conversation = append(conversation, anthropic.NewUserMessage(toolResults...))
-	}
-	return nil
-}
-
-func (a *Agent) runInference(ctx context.Context, conversation []anthropic.MessageParam) (*anthropic.Message, error) {
-	tools := []anthropic.ToolUnionParam{}
-	for _, tool := range a.tools {
-		tools = append(tools, anthropic.ToolUnionParam{OfTool: &anthropic.ToolParam{
-			Name:        tool.Name,
-			Description: anthropic.String(tool.Description),
-			InputSchema: tool.InputSchema,
-		}})
-	}
-
-	return a.client.Messages.New(ctx, anthropic.MessageNewParams{
-		Model:     anthropic.ModelClaudeOpus4_8,
-		MaxTokens: 16000,
-		// Claude Code OAuth tokens are only valid for requests that
-		// identify as Claude Code in the first system block.
-		System: []anthropic.TextBlockParam{
-			{Text: "You are Claude Code, Anthropic's official CLI for Claude."},
-		},
-		Messages: conversation,
-		Tools:    tools,
-	})
-}
-
-func (a *Agent) executeTool(id, name string, input []byte) anthropic.ContentBlockParamUnion {
-	var toolDef ToolDefinition
-	found := false
-	for _, tool := range a.tools {
-		if tool.Name == name {
-			toolDef = tool
-			found = true
-			break
-		}
-	}
-	if !found {
-		return anthropic.NewToolResultBlock(id, "tool not found", true)
-	}
-
-	printToolCall(name, input)
-	response, err := toolDef.Function(input)
-	if err != nil {
-		printToolResult(err.Error(), true)
-		return anthropic.NewToolResultBlock(id, err.Error(), true)
-	}
-	printToolResult(response, false)
-	return anthropic.NewToolResultBlock(id, response, false)
-}
-
 // printToolCall renders a tool invocation in a human-readable form instead of
 // raw JSON, e.g.:
 //
-//	● bash(command: go test ./...)
-//	● bash
-//	    command:
-//	      cat > hello.txt <<'EOF'
+//	● read(path: main.go)
+//	● edit
+//	    path: hello.txt
+//	    content:
 //	      hello
-//	      EOF
 func printToolCall(name string, input []byte) {
 	var args map[string]any
 	_ = json.Unmarshal(input, &args)
@@ -198,8 +102,7 @@ func printToolCall(name string, input []byte) {
 		}
 	}
 
-	// Single-argument tools (like bash) don't need the key label —
-	// show the value directly.
+	// Single-argument tools don't need the key label — show the value directly.
 	if len(keys) == 1 {
 		s := fmt.Sprint(args[keys[0]])
 		if inline {
@@ -246,42 +149,4 @@ func printToolResult(response string, isError bool) {
 			fmt.Printf("  %s\n", line)
 		}
 	}
-}
-
-type ToolDefinition struct {
-	Name        string
-	Description string
-	InputSchema anthropic.ToolInputSchemaParam
-	Function    func(input []byte) (string, error)
-}
-
-// bash
-
-var BashDefinition = ToolDefinition{
-	Name:        "bash",
-	Description: "Execute a bash command in the working directory and return its combined stdout and stderr. Use this for everything: reading files (cat), listing directories (ls), editing files (heredocs, sed), running builds, tests, and git commands.",
-	InputSchema: anthropic.ToolInputSchemaParam{
-		Properties: map[string]any{
-			"command": map[string]any{"type": "string", "description": "The bash command to execute."},
-		},
-		Required: []string{"command"},
-	},
-	Function: func(input []byte) (string, error) {
-		var in struct {
-			Command string `json:"command"`
-		}
-		if err := json.Unmarshal(input, &in); err != nil {
-			return "", err
-		}
-		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
-		defer cancel()
-		out, err := exec.CommandContext(ctx, "bash", "-c", in.Command).CombinedOutput()
-		if err != nil {
-			return "", fmt.Errorf("%s\n%s", err, out)
-		}
-		if len(out) == 0 {
-			return "(no output)", nil
-		}
-		return string(out), nil
-	},
 }

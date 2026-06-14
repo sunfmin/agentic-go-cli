@@ -1,0 +1,194 @@
+package main
+
+import (
+	"context"
+	"fmt"
+
+	"github.com/anthropics/anthropic-sdk-go"
+)
+
+// Model is the seam over the Anthropic Messages API so the agent loop can be
+// driven by a scripted fake in tests.
+type Model interface {
+	Next(ctx context.Context, messages []anthropic.MessageParam, tools []anthropic.ToolUnionParam) (*anthropic.Message, error)
+}
+
+type anthropicModel struct {
+	client *anthropic.Client
+}
+
+func (m anthropicModel) Next(ctx context.Context, messages []anthropic.MessageParam, tools []anthropic.ToolUnionParam) (*anthropic.Message, error) {
+	return m.client.Messages.New(ctx, anthropic.MessageNewParams{
+		Model:     anthropic.ModelClaudeOpus4_8,
+		MaxTokens: 16000,
+		// Claude Code OAuth tokens are only valid for requests that
+		// identify as Claude Code in the first system block.
+		System: []anthropic.TextBlockParam{
+			{Text: "You are Claude Code, Anthropic's official CLI for Claude."},
+		},
+		Messages: messages,
+		Tools:    tools,
+	})
+}
+
+// entry is one tool result the agent holds onto, keyed by the tool_use ID that
+// produced it. Later slices add kind/path/description/forgotten.
+type entry struct {
+	id      string
+	content string
+	isErr   bool
+}
+
+// workingSet holds the live entries, keyed by tool_use ID and kept in insertion
+// order so the payload can be rebuilt deterministically.
+type workingSet struct {
+	byID  map[string]*entry
+	order []string
+}
+
+func newWorkingSet() *workingSet {
+	return &workingSet{byID: map[string]*entry{}}
+}
+
+func (w *workingSet) put(e *entry) {
+	if _, ok := w.byID[e.id]; !ok {
+		w.order = append(w.order, e.id)
+	}
+	w.byID[e.id] = e
+}
+
+func (w *workingSet) get(id string) *entry {
+	return w.byID[id]
+}
+
+type eventKind int
+
+const (
+	evUser eventKind = iota
+	evAssistant
+	evToolResults
+)
+
+// event is one step of the logical conversation. buildPayload reconstructs the
+// messages to send from the event log plus the working set, so the rewrite logic
+// stays a pure function with no I/O.
+type event struct {
+	kind eventKind
+	text string             // evUser
+	asst *anthropic.Message // evAssistant
+	ids  []string           // evToolResults: tool_use IDs produced this turn, in order
+}
+
+type Agent struct {
+	model          Model
+	getUserMessage func() (string, bool)
+	tools          []ToolDefinition
+
+	events []event
+	ws     *workingSet
+	turn   int
+}
+
+func (a *Agent) Run(ctx context.Context) error {
+	fmt.Println("Chat with Claude (ctrl-c to quit)")
+
+	readUserInput := true
+	for {
+		if readUserInput {
+			fmt.Print("\x1b[2m❯\x1b[0m ")
+			userInput, ok := a.getUserMessage()
+			if !ok {
+				break
+			}
+			a.events = append(a.events, event{kind: evUser, text: userInput})
+		}
+
+		message, err := a.model.Next(ctx, buildPayload(a.events, a.ws), a.toolParams())
+		if err != nil {
+			return err
+		}
+		a.events = append(a.events, event{kind: evAssistant, asst: message})
+		a.turn++
+
+		ids := []string{}
+		for _, block := range message.Content {
+			switch variant := block.AsAny().(type) {
+			case anthropic.TextBlock:
+				fmt.Printf("⏺ %s\n", variant.Text)
+			case anthropic.ToolUseBlock:
+				content, isErr := a.executeTool(variant.Name, []byte(variant.Input))
+				a.ws.put(&entry{id: variant.ID, content: content, isErr: isErr})
+				ids = append(ids, variant.ID)
+			}
+		}
+		if len(ids) == 0 {
+			readUserInput = true
+			continue
+		}
+		a.events = append(a.events, event{kind: evToolResults, ids: ids})
+		readUserInput = false
+	}
+	return nil
+}
+
+// buildPayload reconstructs the messages to send to the model from the event log
+// and the working set. In this slice it is the identity transform: every tool
+// result is sent in full.
+func buildPayload(events []event, ws *workingSet) []anthropic.MessageParam {
+	out := []anthropic.MessageParam{}
+	for _, e := range events {
+		switch e.kind {
+		case evUser:
+			out = append(out, anthropic.NewUserMessage(anthropic.NewTextBlock(e.text)))
+		case evAssistant:
+			out = append(out, e.asst.ToParam())
+		case evToolResults:
+			blocks := []anthropic.ContentBlockParamUnion{}
+			for _, id := range e.ids {
+				en := ws.get(id)
+				if en == nil {
+					continue
+				}
+				blocks = append(blocks, anthropic.NewToolResultBlock(id, en.content, en.isErr))
+			}
+			out = append(out, anthropic.NewUserMessage(blocks...))
+		}
+	}
+	return out
+}
+
+func (a *Agent) toolParams() []anthropic.ToolUnionParam {
+	tools := []anthropic.ToolUnionParam{}
+	for _, tool := range a.tools {
+		tools = append(tools, anthropic.ToolUnionParam{OfTool: &anthropic.ToolParam{
+			Name:        tool.Name,
+			Description: anthropic.String(tool.Description),
+			InputSchema: tool.InputSchema,
+		}})
+	}
+	return tools
+}
+
+func (a *Agent) executeTool(name string, input []byte) (string, bool) {
+	var toolDef ToolDefinition
+	found := false
+	for _, tool := range a.tools {
+		if tool.Name == name {
+			toolDef = tool
+			found = true
+			break
+		}
+	}
+	if !found {
+		return "tool not found: " + name, true
+	}
+
+	printToolCall(name, input)
+	response, err := toolDef.Function(input)
+	if err != nil {
+		printToolResult(err.Error(), true)
+		return err.Error(), true
+	}
+	printToolResult(response, false)
+	return response, false
+}

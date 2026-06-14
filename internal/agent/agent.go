@@ -56,14 +56,16 @@ const (
 // entry is one tool result the agent holds onto, keyed by the tool_use ID that
 // produced it.
 type entry struct {
-	id      string
-	kind    entryKind
-	name    string // short label, e.g. "read main.go" or "run"
-	path    string // for read/edit entries: the file path
-	desc    string // Description shown when collapsed into the Manifest
-	content string // full tool output (sent only while this is the latest result)
-	isErr   bool
-	turn    int
+	id        string
+	ref       string // model-visible handle shown in the Manifest, e.g. "#3"
+	kind      entryKind
+	name      string // short label, e.g. "read main.go" or "run"
+	path      string // for read/edit entries: the file path
+	desc      string // Description shown when collapsed into the Manifest
+	content   string // full tool output (sent only while this is the latest result)
+	isErr     bool
+	turn      int
+	forgotten bool
 }
 
 // newEntry classifies a tool result so it can be rendered in the Manifest. Read
@@ -97,16 +99,20 @@ func newEntry(id, toolName string, input []byte, content string, isErr bool, tur
 // is no longer the latest result. A read renders as a live reference (no content),
 // so the model never reasons against a stale copy.
 func (e *entry) manifestLine() string {
+	prefix := ""
+	if e.ref != "" {
+		prefix = e.ref + " "
+	}
 	switch e.kind {
 	case kindRead:
-		return fmt.Sprintf("[read %s @turn %d — re-read for current contents]", e.path, e.turn)
+		return fmt.Sprintf("[%sread %s @turn %d — re-read for current contents]", prefix, e.path, e.turn)
 	case kindRun:
 		if e.path != "" {
-			return fmt.Sprintf("[%s — recall: read %s]", e.desc, e.path)
+			return fmt.Sprintf("[%s%s — recall: read %s]", prefix, e.desc, e.path)
 		}
-		return fmt.Sprintf("[%s]", e.desc)
+		return fmt.Sprintf("[%s%s]", prefix, e.desc)
 	}
-	return fmt.Sprintf("[%s — %s]", e.name, e.desc)
+	return fmt.Sprintf("[%s%s — %s]", prefix, e.name, e.desc)
 }
 
 // workingSet holds the live entries, keyed by tool_use ID and kept in insertion
@@ -129,6 +135,15 @@ func (w *workingSet) put(e *entry) {
 
 func (w *workingSet) get(id string) *entry {
 	return w.byID[id]
+}
+
+func (w *workingSet) getByRef(ref string) *entry {
+	for _, id := range w.order {
+		if e := w.byID[id]; e.ref == ref {
+			return e
+		}
+	}
+	return nil
 }
 
 type eventKind int
@@ -160,6 +175,7 @@ type Agent struct {
 
 	artifactsDir string // where run Artifacts are persisted; created lazily
 	artifactSeq  int
+	refSeq       int
 }
 
 // New builds an agent over a model, an input source, and a set of tools.
@@ -199,7 +215,7 @@ func (a *Agent) Run(ctx context.Context) error {
 			case anthropic.TextBlock:
 				fmt.Printf("⏺ %s\n", variant.Text)
 			case anthropic.ToolUseBlock:
-				content, isErr := a.executeTool(variant.Name, []byte(variant.Input))
+				content, isErr := a.handleTool(variant.Name, []byte(variant.Input))
 				a.ws.put(a.record(variant.ID, variant.Name, []byte(variant.Input), content, isErr))
 				ids = append(ids, variant.ID)
 			}
@@ -235,12 +251,30 @@ func buildPayload(events []event, ws *workingSet) []anthropic.MessageParam {
 		case evUser:
 			out = append(out, anthropic.NewUserMessage(anthropic.NewTextBlock(e.text)))
 		case evAssistant:
-			out = append(out, e.asst.ToParam())
+			// Rebuild the assistant turn, dropping tool_use blocks for forgotten
+			// entries so they pair with no orphaned tool_result.
+			blocks := []anthropic.ContentBlockParamUnion{}
+			for _, b := range e.asst.Content {
+				switch v := b.AsAny().(type) {
+				case anthropic.TextBlock:
+					if v.Text != "" {
+						blocks = append(blocks, anthropic.NewTextBlock(v.Text))
+					}
+				case anthropic.ToolUseBlock:
+					if en := ws.get(v.ID); en != nil && en.forgotten {
+						continue
+					}
+					blocks = append(blocks, anthropic.NewToolUseBlock(v.ID, v.Input, v.Name))
+				}
+			}
+			if len(blocks) > 0 {
+				out = append(out, anthropic.NewAssistantMessage(blocks...))
+			}
 		case evToolResults:
 			blocks := []anthropic.ContentBlockParamUnion{}
 			for _, id := range e.ids {
 				en := ws.get(id)
-				if en == nil {
+				if en == nil || en.forgotten {
 					continue
 				}
 				if latest[id] {
@@ -249,7 +283,9 @@ func buildPayload(events []event, ws *workingSet) []anthropic.MessageParam {
 					blocks = append(blocks, anthropic.NewToolResultBlock(id, en.manifestLine(), false))
 				}
 			}
-			out = append(out, anthropic.NewUserMessage(blocks...))
+			if len(blocks) > 0 {
+				out = append(out, anthropic.NewUserMessage(blocks...))
+			}
 		}
 	}
 	return out
@@ -267,28 +303,50 @@ func (a *Agent) toolParams() []anthropic.ToolUnionParam {
 	return tools
 }
 
-func (a *Agent) executeTool(name string, input []byte) (string, bool) {
-	var toolDef tool.ToolDefinition
-	found := false
+// handleTool runs a tool call, intercepting agent built-ins (forget) that need
+// to mutate the working set, and dispatching everything else to the tool table.
+func (a *Agent) handleTool(name string, input []byte) (string, bool) {
+	ui.PrintToolCall(name, input)
+	var content string
+	var isErr bool
+	switch name {
+	case "forget":
+		content, isErr = a.forget(input)
+	default:
+		content, isErr = a.runTool(name, input)
+	}
+	ui.PrintToolResult(content, isErr)
+	return content, isErr
+}
+
+func (a *Agent) runTool(name string, input []byte) (string, bool) {
 	for _, t := range a.tools {
 		if t.Name == name {
-			toolDef = t
-			found = true
-			break
+			response, err := t.Function(input)
+			if err != nil {
+				return err.Error(), true
+			}
+			return response, false
 		}
 	}
-	if !found {
-		return "tool not found: " + name, true
-	}
+	return "tool not found: " + name, true
+}
 
-	ui.PrintToolCall(name, input)
-	response, err := toolDef.Function(input)
-	if err != nil {
-		ui.PrintToolResult(err.Error(), true)
+// forget marks the entry with the given Manifest reference as forgotten, so
+// buildPayload drops both its tool_use and tool_result from later payloads.
+func (a *Agent) forget(input []byte) (string, bool) {
+	var in struct {
+		Ref string `json:"ref"`
+	}
+	if err := json.Unmarshal(input, &in); err != nil {
 		return err.Error(), true
 	}
-	ui.PrintToolResult(response, false)
-	return response, false
+	en := a.ws.getByRef(in.Ref)
+	if en == nil {
+		return "no entry with reference " + in.Ref, true
+	}
+	en.forgotten = true
+	return "forgot " + in.Ref, false
 }
 
 // record classifies a tool result into a working-set entry. A run's output is
@@ -296,6 +354,8 @@ func (a *Agent) executeTool(name string, input []byte) (string, bool) {
 // recalled later by reading that file.
 func (a *Agent) record(id, toolName string, input []byte, content string, isErr bool) *entry {
 	e := newEntry(id, toolName, input, content, isErr, a.turn)
+	a.refSeq++
+	e.ref = fmt.Sprintf("#%d", a.refSeq)
 	if e.kind == kindRun {
 		if p, err := a.writeArtifact(content); err == nil {
 			e.path = p

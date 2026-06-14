@@ -75,6 +75,24 @@ var EditDefinition = ToolDefinition{
 	},
 }
 
+// ForgetDefinition lets the model drop an entry from the working set. It is
+// declared here for its schema, but the agent intercepts and handles it (it
+// needs to mutate working-set state), so this Function is never called.
+var ForgetDefinition = ToolDefinition{
+	Name: "forget",
+	Description: "Drop an entry from the working set by its Manifest reference (the #N shown in a " +
+		"collapsed entry). Use it to discard output you no longer need so it stops taking room.",
+	InputSchema: anthropic.ToolInputSchemaParam{
+		Properties: map[string]any{
+			"ref": map[string]any{"type": "string", "description": "The #N reference of the entry to forget, as shown in the Manifest."},
+		},
+		Required: []string{"ref"},
+	},
+	Function: func(input []byte) (string, error) {
+		return "", fmt.Errorf("forget is handled by the agent")
+	},
+}
+
 // RunDefinition executes a shell command. Its description fences it off from file
 // reads/edits, which must go through read/edit so file state stays tracked
 // (ADR-0001).

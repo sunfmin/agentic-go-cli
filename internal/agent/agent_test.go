@@ -169,7 +169,7 @@ func TestLoopCollapsesPriorRunResult(t *testing.T) {
 		t.Fatalf("model called %d times, want >= 3", len(fm.calls))
 	}
 	third := fm.calls[2]
-	if got := findToolResult(third, "c1"); !strings.HasPrefix(got, "[run: echo AAAA") || got == "AAAA\n" {
+	if got := findToolResult(third, "c1"); !strings.Contains(got, "run: echo AAAA") || got == "AAAA\n" {
 		t.Fatalf("prior run result = %q, want collapsed Manifest line", got)
 	}
 	if got := findToolResult(third, "c2"); got != "BBBB\n" {
@@ -217,6 +217,76 @@ func TestRunArtifactStoredAndRecallable(t *testing.T) {
 func readInput(key, value string) []byte {
 	b, _ := json.Marshal(map[string]string{key: value})
 	return b
+}
+
+// hasToolUse reports whether any assistant message in the payload contains a
+// tool_use block with the given ID.
+func hasToolUse(payload []anthropic.MessageParam, id string) bool {
+	for _, m := range payload {
+		for _, b := range m.Content {
+			if b.OfToolUse != nil && b.OfToolUse.ID == id {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func TestBuildPayloadForgetDropsBothHalves(t *testing.T) {
+	ws := newWorkingSet()
+	ws.put(&entry{id: "a", ref: "#1", kind: kindRun, desc: "run: go build", content: "buildout", forgotten: true})
+	ws.put(&entry{id: "b", ref: "#2", kind: kindRun, desc: "run: go test", content: "testout"})
+
+	a1 := assistantMessage(t, `{"role":"assistant","content":[{"type":"tool_use","id":"a","name":"run","input":{"command":"go build"}}]}`)
+	a2 := assistantMessage(t, `{"role":"assistant","content":[{"type":"tool_use","id":"b","name":"run","input":{"command":"go test"}}]}`)
+	events := []event{
+		{kind: evUser, text: "x"},
+		{kind: evAssistant, asst: a1},
+		{kind: evToolResults, ids: []string{"a"}},
+		{kind: evAssistant, asst: a2},
+		{kind: evToolResults, ids: []string{"b"}},
+	}
+
+	payload := buildPayload(events, ws)
+	if hasToolUse(payload, "a") {
+		t.Fatalf("forgotten tool_use 'a' is still present")
+	}
+	if findToolResult(payload, "a") != "" {
+		t.Fatalf("forgotten tool_result 'a' is still present")
+	}
+	if !hasToolUse(payload, "b") || findToolResult(payload, "b") != "testout" {
+		t.Fatalf("kept entry 'b' should remain in full")
+	}
+	for _, m := range payload {
+		if len(m.Content) == 0 {
+			t.Fatalf("payload contains an empty message")
+		}
+	}
+}
+
+func TestLoopForgetRemovesEntryFromPayload(t *testing.T) {
+	fm := &fakeModel{replies: []*anthropic.Message{
+		assistantMessage(t, `{"role":"assistant","content":[{"type":"tool_use","id":"c1","name":"run","input":{"command":"echo X"}}]}`),
+		assistantMessage(t, `{"role":"assistant","content":[{"type":"tool_use","id":"f1","name":"forget","input":{"ref":"#1"}}]}`),
+		assistantMessage(t, `{"role":"assistant","content":[{"type":"text","text":"done"}]}`),
+	}}
+
+	a := New(fm, scriptedInput("go"), []tool.ToolDefinition{tool.ReadDefinition, tool.EditDefinition, tool.RunDefinition, tool.ForgetDefinition})
+	a.artifactsDir = t.TempDir()
+	if err := a.Run(context.Background()); err != nil {
+		t.Fatalf("run: %v", err)
+	}
+
+	if !a.ws.get("c1").forgotten {
+		t.Fatalf("entry c1 should be marked forgotten")
+	}
+	last := fm.calls[len(fm.calls)-1]
+	if hasToolUse(last, "c1") {
+		t.Fatalf("forgotten tool_use c1 still in payload (orphan risk)")
+	}
+	if findToolResult(last, "c1") != "" {
+		t.Fatalf("forgotten tool_result c1 still in payload")
+	}
 }
 
 func TestLoopExecutesToolAndResultEntersPayload(t *testing.T) {

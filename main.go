@@ -38,7 +38,7 @@ func main() {
 	a := agent.New(
 		agent.NewAnthropicModel(&client),
 		getUserMessage,
-		[]tool.ToolDefinition{tool.ReadDefinition, tool.EditDefinition, tool.RunDefinition},
+		[]tool.ToolDefinition{tool.ReadDefinition, tool.EditDefinition, tool.RunDefinition, tool.ForgetDefinition},
 	)
 	if err := a.Run(context.Background()); err != nil {
 		fmt.Fprintln(os.Stderr, "error:", err)

@@ -1,10 +1,14 @@
-package main
+// Package agent runs the chat loop and rewrites what is sent to the model each
+// round from an internal event log plus the working set.
+package agent
 
 import (
 	"context"
 	"fmt"
 
 	"github.com/anthropics/anthropic-sdk-go"
+	"github.com/sunfmin/agentic-go-cli/internal/tool"
+	"github.com/sunfmin/agentic-go-cli/internal/ui"
 )
 
 // Model is the seam over the Anthropic Messages API so the agent loop can be
@@ -15,6 +19,11 @@ type Model interface {
 
 type anthropicModel struct {
 	client *anthropic.Client
+}
+
+// NewAnthropicModel wraps a real Anthropic client as a Model.
+func NewAnthropicModel(client *anthropic.Client) Model {
+	return anthropicModel{client: client}
 }
 
 func (m anthropicModel) Next(ctx context.Context, messages []anthropic.MessageParam, tools []anthropic.ToolUnionParam) (*anthropic.Message, error) {
@@ -82,11 +91,21 @@ type event struct {
 type Agent struct {
 	model          Model
 	getUserMessage func() (string, bool)
-	tools          []ToolDefinition
+	tools          []tool.ToolDefinition
 
 	events []event
 	ws     *workingSet
 	turn   int
+}
+
+// New builds an agent over a model, an input source, and a set of tools.
+func New(model Model, getUserMessage func() (string, bool), tools []tool.ToolDefinition) *Agent {
+	return &Agent{
+		model:          model,
+		getUserMessage: getUserMessage,
+		tools:          tools,
+		ws:             newWorkingSet(),
+	}
 }
 
 func (a *Agent) Run(ctx context.Context) error {
@@ -159,22 +178,22 @@ func buildPayload(events []event, ws *workingSet) []anthropic.MessageParam {
 
 func (a *Agent) toolParams() []anthropic.ToolUnionParam {
 	tools := []anthropic.ToolUnionParam{}
-	for _, tool := range a.tools {
+	for _, t := range a.tools {
 		tools = append(tools, anthropic.ToolUnionParam{OfTool: &anthropic.ToolParam{
-			Name:        tool.Name,
-			Description: anthropic.String(tool.Description),
-			InputSchema: tool.InputSchema,
+			Name:        t.Name,
+			Description: anthropic.String(t.Description),
+			InputSchema: t.InputSchema,
 		}})
 	}
 	return tools
 }
 
 func (a *Agent) executeTool(name string, input []byte) (string, bool) {
-	var toolDef ToolDefinition
+	var toolDef tool.ToolDefinition
 	found := false
-	for _, tool := range a.tools {
-		if tool.Name == name {
-			toolDef = tool
+	for _, t := range a.tools {
+		if t.Name == name {
+			toolDef = t
 			found = true
 			break
 		}
@@ -183,12 +202,12 @@ func (a *Agent) executeTool(name string, input []byte) (string, bool) {
 		return "tool not found: " + name, true
 	}
 
-	printToolCall(name, input)
+	ui.PrintToolCall(name, input)
 	response, err := toolDef.Function(input)
 	if err != nil {
-		printToolResult(err.Error(), true)
+		ui.PrintToolResult(err.Error(), true)
 		return err.Error(), true
 	}
-	printToolResult(response, false)
+	ui.PrintToolResult(response, false)
 	return response, false
 }

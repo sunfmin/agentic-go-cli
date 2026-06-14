@@ -1,12 +1,14 @@
-package main
+package agent
 
 import (
 	"context"
 	"encoding/json"
+	"os"
 	"path/filepath"
 	"testing"
 
 	"github.com/anthropics/anthropic-sdk-go"
+	"github.com/sunfmin/agentic-go-cli/internal/tool"
 )
 
 // fakeModel returns scripted assistant messages and records the payloads it saw,
@@ -32,8 +34,7 @@ func assistantMessage(t *testing.T, jsonStr string) *anthropic.Message {
 	return &m
 }
 
-// toolResultText returns the text of the first tool_result block in a message,
-// or "" if there is none.
+// toolResultText returns the text of the first tool_result block in a message.
 func toolResultText(m anthropic.MessageParam) string {
 	for _, b := range m.Content {
 		if b.OfToolResult != nil {
@@ -56,6 +57,13 @@ func scriptedInput(inputs ...string) func() (string, bool) {
 		s := inputs[i]
 		i++
 		return s, true
+	}
+}
+
+func writeFile(t *testing.T, path, content string) {
+	t.Helper()
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
 	}
 }
 
@@ -89,12 +97,7 @@ func TestLoopExecutesToolAndResultEntersPayload(t *testing.T) {
 		assistantMessage(t, `{"role":"assistant","content":[{"type":"text","text":"done"}]}`),
 	}}
 
-	a := &Agent{
-		model:          fm,
-		getUserMessage: scriptedInput("read the file"),
-		tools:          []ToolDefinition{ReadDefinition, EditDefinition, RunDefinition},
-		ws:             newWorkingSet(),
-	}
+	a := New(fm, scriptedInput("read the file"), []tool.ToolDefinition{tool.ReadDefinition, tool.EditDefinition, tool.RunDefinition})
 	if err := a.Run(context.Background()); err != nil {
 		t.Fatalf("run: %v", err)
 	}

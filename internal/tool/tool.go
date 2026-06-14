@@ -1,4 +1,5 @@
-package main
+// Package tool defines the structured tools the agent exposes to the model.
+package tool
 
 import (
 	"context"

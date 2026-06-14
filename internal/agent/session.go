@@ -24,9 +24,10 @@ type indexState struct {
 	Model       string       `json:"model,omitempty"`
 	Turn        int          `json:"turn"`
 	Round       int          `json:"round"`
-	RefSeq      int          `json:"ref_seq"`
-	ArtifactSeq int          `json:"artifact_seq"`
-	Entries     []entryIndex `json:"entries"`
+	RefSeq      int            `json:"ref_seq"`
+	ArtifactSeq int            `json:"artifact_seq"`
+	Entries     []entryIndex   `json:"entries"`
+	Turns       map[int]string `json:"turns,omitempty"` // upgraded collapsed-Turn descriptions, by turn number
 }
 
 // entryIndex is one Working Set entry without its content: the content is
@@ -77,6 +78,9 @@ func (a *Agent) indexState() indexState {
 		Round:       a.round,
 		RefSeq:      a.refSeq,
 		ArtifactSeq: a.artifactSeq,
+	}
+	if len(a.turnDesc) > 0 {
+		st.Turns = a.turnDesc
 	}
 	for _, id := range a.ws.order {
 		en := a.ws.byID[id]

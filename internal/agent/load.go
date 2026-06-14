@@ -53,6 +53,9 @@ func (a *Agent) Load(dir string) error {
 	a.round = idx.Round
 	a.refSeq = idx.RefSeq
 	a.artifactSeq = idx.ArtifactSeq
+	if idx.Turns != nil {
+		a.turnDesc = idx.Turns
+	}
 
 	for _, e := range idx.Entries {
 		en := &entry{

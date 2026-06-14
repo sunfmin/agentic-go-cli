@@ -319,6 +319,54 @@ func TestDescribeFallsBackToCommandLabel(t *testing.T) {
 	}
 }
 
+func TestDescribeUpgradesTurnSynopsis(t *testing.T) {
+	dir := t.TempDir()
+	fm := &fakeModel{replies: []*anthropic.Message{
+		assistantMessage(t, `{"role":"assistant","content":[{"type":"text","text":"done A"}]}`),  // Turn 1
+		assistantMessage(t, `{"role":"assistant","content":[{"type":"text","text":"done B"}]}`),  // Turn 2
+		// Turn 3: describe Turn 1, then answer.
+		assistantMessage(t, `{"role":"assistant","content":[{"type":"tool_use","id":"d1","name":"describe","input":{"turn":1,"gist":"handled task A"}}]}`),
+		assistantMessage(t, `{"role":"assistant","content":[{"type":"text","text":"summary"}]}`),
+	}}
+	a := New(fm, scriptedInput("do A", "do B", "summarize"),
+		[]tool.ToolDefinition{tool.RunDefinition, tool.DescribeDefinition})
+	a.sessionDir = dir
+	if err := a.Run(context.Background()); err != nil {
+		t.Fatalf("run: %v", err)
+	}
+
+	// The collapsed Turn 1 shows the upgraded gist, not the prompt's first line.
+	last := fm.calls[len(fm.calls)-1]
+	if !payloadContains(last, "[Turn 1 — handled task A") {
+		t.Fatalf("collapsed Turn 1 should show the upgraded gist")
+	}
+	if payloadContains(last, "[Turn 1 — do A") {
+		t.Fatalf("collapsed Turn 1 still shows the bootstrap, not the upgrade")
+	}
+
+	// It persists in index.json.
+	data, err := os.ReadFile(filepath.Join(dir, indexFileName))
+	if err != nil {
+		t.Fatalf("index: %v", err)
+	}
+	var st indexState
+	if err := json.Unmarshal(data, &st); err != nil {
+		t.Fatalf("index JSON: %v", err)
+	}
+	if st.Turns[1] != "handled task A" {
+		t.Fatalf("turn description not persisted; got %v", st.Turns)
+	}
+
+	// And it survives resume.
+	a2 := New(&fakeModel{}, scriptedInput(), []tool.ToolDefinition{tool.DescribeDefinition})
+	if err := a2.Load(dir); err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if a2.turnDesc[1] != "handled task A" {
+		t.Fatalf("turn description not restored on resume; got %v", a2.turnDesc)
+	}
+}
+
 func TestOldTurnsCollapseToSynopsis(t *testing.T) {
 	// Three Turns; with the window of 2, Turn 1 collapses on the Turn-3 request.
 	fm := &fakeModel{replies: []*anthropic.Message{

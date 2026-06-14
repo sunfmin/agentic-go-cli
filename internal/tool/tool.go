@@ -99,14 +99,17 @@ var ForgetDefinition = ToolDefinition{
 // called.
 var DescribeDefinition = ToolDefinition{
 	Name: "describe",
-	Description: "Attach a one-line gist to an entry by its Manifest reference (the #N), summarizing what a " +
-		"run produced (e.g. \"go test: 3 failures in store\"). The gist becomes that entry's Manifest description.",
+	Description: "Attach a one-line gist as a Description. Target either a Working Set entry by its " +
+		"Manifest reference (ref: the #N), summarizing what a run produced (e.g. \"go test: 3 failures in " +
+		"store\"), or a past Turn by its number (turn: N), summarizing the outcome of that whole exchange so " +
+		"its collapsed synopsis reads better than the prompt's first line. Give exactly one of ref or turn.",
 	InputSchema: anthropic.ToolInputSchemaParam{
 		Properties: map[string]any{
-			"ref":  map[string]any{"type": "string", "description": "The #N reference of the entry to describe."},
-			"gist": map[string]any{"type": "string", "description": "A one-line summary of the result."},
+			"ref":  map[string]any{"type": "string", "description": "The #N reference of the Working Set entry to describe."},
+			"turn": map[string]any{"type": "integer", "description": "The number of the Turn to describe (as shown in a collapsed synopsis or the Working Set header)."},
+			"gist": map[string]any{"type": "string", "description": "A one-line summary."},
 		},
-		Required: []string{"ref", "gist"},
+		Required: []string{"gist"},
 	},
 	Function: func(input []byte) (string, error) {
 		return "", fmt.Errorf("describe is handled by the agent")

@@ -175,10 +175,11 @@ type Agent struct {
 	getUserMessage func() (string, bool)
 	tools          []tool.ToolDefinition
 
-	events []event
-	ws     *workingSet
-	turn   int // Turn: one user prompt plus the entire AI reply that follows
-	round  int // Round: one model response within a Turn
+	events   []event
+	ws       *workingSet
+	turn     int            // Turn: one user prompt plus the entire AI reply that follows
+	round    int            // Round: one model response within a Turn
+	turnDesc map[int]string // upgraded one-line Descriptions for collapsed Turns, by turn number
 
 	sessionDir  string // this Session's on-disk directory; created lazily
 	createdAt   string // RFC3339 timestamp recorded in the index, set on first persist
@@ -193,6 +194,7 @@ func New(model Model, getUserMessage func() (string, bool), tools []tool.ToolDef
 		getUserMessage: getUserMessage,
 		tools:          tools,
 		ws:             newWorkingSet(),
+		turnDesc:       map[int]string{},
 	}
 }
 
@@ -211,7 +213,7 @@ func (a *Agent) Run(ctx context.Context) error {
 			a.events = append(a.events, event{kind: evUser, text: userInput})
 		}
 
-		message, err := a.model.Next(ctx, buildPayload(a.events, a.ws, nil), a.toolParams())
+		message, err := a.model.Next(ctx, buildPayload(a.events, a.ws, a.turnDesc), a.toolParams())
 		if err != nil {
 			return err
 		}
@@ -320,7 +322,7 @@ func buildPayload(events []event, ws *workingSet, turnDesc map[int]string) []ant
 	// The Manifest is its own always-current section rather than woven into the
 	// tool_result positions. Attach it to the active prompt (the last message is
 	// always a user message when the model is about to respond).
-	if mani := manifestText(ws, latest); mani != "" {
+	if mani := manifestText(ws, latest, totalTurns); mani != "" {
 		if n := len(out); n > 0 && out[n-1].Role == anthropic.MessageParamRoleUser {
 			out[n-1].Content = append(out[n-1].Content, anthropic.NewTextBlock(mani))
 		} else {
@@ -392,7 +394,7 @@ func collapsedPointer(en *entry) string {
 
 // manifestText renders the standalone Manifest: one line per live, non-latest
 // entry, by which the model decides whether to recall an entry's full content.
-func manifestText(ws *workingSet, latest map[string]bool) string {
+func manifestText(ws *workingSet, latest map[string]bool, curTurn int) string {
 	var lines []string
 	for _, id := range ws.order {
 		en := ws.byID[id]
@@ -404,7 +406,8 @@ func manifestText(ws *workingSet, latest map[string]bool) string {
 	if len(lines) == 0 {
 		return ""
 	}
-	return "Working Set — older results are listed here; recall one by reading its file:\n" + strings.Join(lines, "\n")
+	header := fmt.Sprintf("Working Set (you are on Turn %d; describe a Turn by its number to improve its collapsed synopsis) — recall an entry by reading its file:\n", curTurn)
+	return header + strings.Join(lines, "\n")
 }
 
 func (a *Agent) toolParams() []anthropic.ToolUnionParam {
@@ -472,10 +475,17 @@ func (a *Agent) forget(input []byte) (string, bool) {
 func (a *Agent) describe(input []byte) (string, bool) {
 	var in struct {
 		Ref  string `json:"ref"`
+		Turn int    `json:"turn"`
 		Gist string `json:"gist"`
 	}
 	if err := json.Unmarshal(input, &in); err != nil {
 		return err.Error(), true
+	}
+	// A Turn target upgrades that Turn's collapsed synopsis; a ref target
+	// upgrades a Working Set entry's Manifest Description.
+	if in.Turn > 0 {
+		a.turnDesc[in.Turn] = in.Gist
+		return fmt.Sprintf("described Turn %d", in.Turn), false
 	}
 	en := a.ws.getByRef(in.Ref)
 	if en == nil {

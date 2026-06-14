@@ -6,6 +6,8 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"os"
+	"path/filepath"
 
 	"github.com/anthropics/anthropic-sdk-go"
 	"github.com/sunfmin/agentic-go-cli/internal/tool"
@@ -95,8 +97,14 @@ func newEntry(id, toolName string, input []byte, content string, isErr bool, tur
 // is no longer the latest result. A read renders as a live reference (no content),
 // so the model never reasons against a stale copy.
 func (e *entry) manifestLine() string {
-	if e.kind == kindRead {
+	switch e.kind {
+	case kindRead:
 		return fmt.Sprintf("[read %s @turn %d — re-read for current contents]", e.path, e.turn)
+	case kindRun:
+		if e.path != "" {
+			return fmt.Sprintf("[%s — recall: read %s]", e.desc, e.path)
+		}
+		return fmt.Sprintf("[%s]", e.desc)
 	}
 	return fmt.Sprintf("[%s — %s]", e.name, e.desc)
 }
@@ -149,6 +157,9 @@ type Agent struct {
 	events []event
 	ws     *workingSet
 	turn   int
+
+	artifactsDir string // where run Artifacts are persisted; created lazily
+	artifactSeq  int
 }
 
 // New builds an agent over a model, an input source, and a set of tools.
@@ -189,7 +200,7 @@ func (a *Agent) Run(ctx context.Context) error {
 				fmt.Printf("⏺ %s\n", variant.Text)
 			case anthropic.ToolUseBlock:
 				content, isErr := a.executeTool(variant.Name, []byte(variant.Input))
-				a.ws.put(newEntry(variant.ID, variant.Name, []byte(variant.Input), content, isErr, a.turn))
+				a.ws.put(a.record(variant.ID, variant.Name, []byte(variant.Input), content, isErr))
 				ids = append(ids, variant.ID)
 			}
 		}
@@ -278,4 +289,35 @@ func (a *Agent) executeTool(name string, input []byte) (string, bool) {
 	}
 	ui.PrintToolResult(response, false)
 	return response, false
+}
+
+// record classifies a tool result into a working-set entry. A run's output is
+// non-reproducible, so it is persisted to an Artifact file on disk and can be
+// recalled later by reading that file.
+func (a *Agent) record(id, toolName string, input []byte, content string, isErr bool) *entry {
+	e := newEntry(id, toolName, input, content, isErr, a.turn)
+	if e.kind == kindRun {
+		if p, err := a.writeArtifact(content); err == nil {
+			e.path = p
+		}
+	}
+	return e
+}
+
+// writeArtifact persists content to a new file in the Artifacts directory
+// (created lazily) and returns its path.
+func (a *Agent) writeArtifact(content string) (string, error) {
+	if a.artifactsDir == "" {
+		dir, err := os.MkdirTemp("", "agentic-artifacts-")
+		if err != nil {
+			return "", err
+		}
+		a.artifactsDir = dir
+	}
+	a.artifactSeq++
+	p := filepath.Join(a.artifactsDir, fmt.Sprintf("run-%d.txt", a.artifactSeq))
+	if err := os.WriteFile(p, []byte(content), 0o644); err != nil {
+		return "", err
+	}
+	return p, nil
 }

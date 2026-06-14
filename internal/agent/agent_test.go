@@ -121,7 +121,7 @@ func TestBuildPayloadCollapsesOlderResults(t *testing.T) {
 	}
 
 	payload := buildPayload(events, ws)
-	if got := findToolResult(payload, "a"); got != "[run — run: go build]" {
+	if got := findToolResult(payload, "a"); got != "[run: go build]" {
 		t.Fatalf("older result = %q, want the collapsed Manifest line", got)
 	}
 	if got := findToolResult(payload, "b"); got != "FRESH test output" {
@@ -161,6 +161,7 @@ func TestLoopCollapsesPriorRunResult(t *testing.T) {
 	}}
 
 	a := New(fm, scriptedInput("go"), []tool.ToolDefinition{tool.ReadDefinition, tool.EditDefinition, tool.RunDefinition})
+	a.artifactsDir = t.TempDir()
 	if err := a.Run(context.Background()); err != nil {
 		t.Fatalf("run: %v", err)
 	}
@@ -168,12 +169,54 @@ func TestLoopCollapsesPriorRunResult(t *testing.T) {
 		t.Fatalf("model called %d times, want >= 3", len(fm.calls))
 	}
 	third := fm.calls[2]
-	if got := findToolResult(third, "c1"); got != "[run — run: echo AAAA]" {
-		t.Fatalf("prior run result = %q, want collapsed", got)
+	if got := findToolResult(third, "c1"); !strings.HasPrefix(got, "[run: echo AAAA") || got == "AAAA\n" {
+		t.Fatalf("prior run result = %q, want collapsed Manifest line", got)
 	}
 	if got := findToolResult(third, "c2"); got != "BBBB\n" {
 		t.Fatalf("latest run result = %q, want full output", got)
 	}
+}
+
+func TestRunArtifactStoredAndRecallable(t *testing.T) {
+	fm := &fakeModel{replies: []*anthropic.Message{
+		assistantMessage(t, `{"role":"assistant","content":[{"type":"tool_use","id":"c1","name":"run","input":{"command":"echo HELLO"}}]}`),
+		assistantMessage(t, `{"role":"assistant","content":[{"type":"text","text":"ok"}]}`),
+	}}
+
+	a := New(fm, scriptedInput("run it"), []tool.ToolDefinition{tool.ReadDefinition, tool.EditDefinition, tool.RunDefinition})
+	a.artifactsDir = t.TempDir()
+	if err := a.Run(context.Background()); err != nil {
+		t.Fatalf("run: %v", err)
+	}
+
+	en := a.ws.get("c1")
+	if en == nil || en.kind != kindRun {
+		t.Fatalf("missing run entry")
+	}
+	if en.path == "" {
+		t.Fatalf("run entry has no Artifact path")
+	}
+	data, err := os.ReadFile(en.path)
+	if err != nil {
+		t.Fatalf("artifact file: %v", err)
+	}
+	if string(data) != "HELLO\n" {
+		t.Fatalf("artifact content = %q, want %q", data, "HELLO\n")
+	}
+
+	// Recall without re-running: read the Artifact file via the read tool.
+	recalled, err := tool.ReadDefinition.Function(readInput("path", en.path))
+	if err != nil {
+		t.Fatalf("recall: %v", err)
+	}
+	if recalled != "HELLO\n" {
+		t.Fatalf("recalled = %q, want %q", recalled, "HELLO\n")
+	}
+}
+
+func readInput(key, value string) []byte {
+	b, _ := json.Marshal(map[string]string{key: value})
+	return b
 }
 
 func TestLoopExecutesToolAndResultEntersPayload(t *testing.T) {

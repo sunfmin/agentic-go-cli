@@ -312,6 +312,8 @@ func (a *Agent) handleTool(name string, input []byte) (string, bool) {
 	switch name {
 	case "forget":
 		content, isErr = a.forget(input)
+	case "describe":
+		content, isErr = a.describe(input)
 	default:
 		content, isErr = a.runTool(name, input)
 	}
@@ -347,6 +349,24 @@ func (a *Agent) forget(input []byte) (string, bool) {
 	}
 	en.forgotten = true
 	return "forgot " + in.Ref, false
+}
+
+// describe attaches a one-line gist to an entry, replacing its Manifest
+// Description (for a run Artifact, the bare command label until then).
+func (a *Agent) describe(input []byte) (string, bool) {
+	var in struct {
+		Ref  string `json:"ref"`
+		Gist string `json:"gist"`
+	}
+	if err := json.Unmarshal(input, &in); err != nil {
+		return err.Error(), true
+	}
+	en := a.ws.getByRef(in.Ref)
+	if en == nil {
+		return "no entry with reference " + in.Ref, true
+	}
+	en.desc = in.Gist
+	return "described " + in.Ref, false
 }
 
 // record classifies a tool result into a working-set entry. A run's output is

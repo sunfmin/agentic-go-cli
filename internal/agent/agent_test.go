@@ -264,6 +264,47 @@ func TestBuildPayloadForgetDropsBothHalves(t *testing.T) {
 	}
 }
 
+func TestLoopDescribeReplacesRunLabelWithGist(t *testing.T) {
+	fm := &fakeModel{replies: []*anthropic.Message{
+		assistantMessage(t, `{"role":"assistant","content":[{"type":"tool_use","id":"c1","name":"run","input":{"command":"echo data"}}]}`),
+		assistantMessage(t, `{"role":"assistant","content":[{"type":"tool_use","id":"d1","name":"describe","input":{"ref":"#1","gist":"echoed the data"}}]}`),
+		assistantMessage(t, `{"role":"assistant","content":[{"type":"text","text":"done"}]}`),
+	}}
+
+	a := New(fm, scriptedInput("go"), []tool.ToolDefinition{tool.RunDefinition, tool.ForgetDefinition, tool.DescribeDefinition})
+	a.artifactsDir = t.TempDir()
+	if err := a.Run(context.Background()); err != nil {
+		t.Fatalf("run: %v", err)
+	}
+
+	last := fm.calls[len(fm.calls)-1]
+	got := findToolResult(last, "c1")
+	if !strings.Contains(got, "echoed the data") {
+		t.Fatalf("collapsed run = %q, want it to show the gist", got)
+	}
+	if strings.Contains(got, "run: echo data") {
+		t.Fatalf("collapsed run = %q, should no longer show the command label", got)
+	}
+}
+
+func TestDescribeFallsBackToCommandLabel(t *testing.T) {
+	// An undescribed run keeps its command label in the Manifest.
+	ws := newWorkingSet()
+	ws.put(&entry{id: "a", ref: "#1", kind: kindRun, desc: "run: go vet", content: "out"})
+	ws.put(&entry{id: "b", ref: "#2", kind: kindRun, desc: "run: go test", content: "fresh"})
+	a1 := assistantMessage(t, `{"role":"assistant","content":[{"type":"tool_use","id":"a","name":"run","input":{"command":"go vet"}}]}`)
+	a2 := assistantMessage(t, `{"role":"assistant","content":[{"type":"tool_use","id":"b","name":"run","input":{"command":"go test"}}]}`)
+	events := []event{
+		{kind: evAssistant, asst: a1},
+		{kind: evToolResults, ids: []string{"a"}},
+		{kind: evAssistant, asst: a2},
+		{kind: evToolResults, ids: []string{"b"}},
+	}
+	if got := findToolResult(buildPayload(events, ws), "a"); !strings.Contains(got, "run: go vet") {
+		t.Fatalf("undescribed run = %q, want the command label fallback", got)
+	}
+}
+
 func TestLoopForgetRemovesEntryFromPayload(t *testing.T) {
 	fm := &fakeModel{replies: []*anthropic.Message{
 		assistantMessage(t, `{"role":"assistant","content":[{"type":"tool_use","id":"c1","name":"run","input":{"command":"echo X"}}]}`),

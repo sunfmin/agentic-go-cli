@@ -93,6 +93,26 @@ var ForgetDefinition = ToolDefinition{
 	},
 }
 
+// DescribeDefinition lets the model attach a one-line gist to a run Artifact so
+// its Manifest entry says what the output was, not just which command ran. Like
+// forget, it is intercepted and handled by the agent; this Function is never
+// called.
+var DescribeDefinition = ToolDefinition{
+	Name: "describe",
+	Description: "Attach a one-line gist to an entry by its Manifest reference (the #N), summarizing what a " +
+		"run produced (e.g. \"go test: 3 failures in store\"). The gist becomes that entry's Manifest description.",
+	InputSchema: anthropic.ToolInputSchemaParam{
+		Properties: map[string]any{
+			"ref":  map[string]any{"type": "string", "description": "The #N reference of the entry to describe."},
+			"gist": map[string]any{"type": "string", "description": "A one-line summary of the result."},
+		},
+		Required: []string{"ref", "gist"},
+	},
+	Function: func(input []byte) (string, error) {
+		return "", fmt.Errorf("describe is handled by the agent")
+	},
+}
+
 // RunDefinition executes a shell command. Its description fences it off from file
 // reads/edits, which must go through read/edit so file state stays tracked
 // (ADR-0001).

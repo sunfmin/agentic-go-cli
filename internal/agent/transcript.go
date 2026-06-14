@@ -51,7 +51,7 @@ func (a *Agent) currentTurnEvents() []event {
 // renderTurnFile renders one Turn as YAML frontmatter carrying only structure
 // (the Manifest refs that fired in each Round, in order) plus a human-readable
 // transcript body that reuses the terminal's markers: ❯ user prompt, ⏺ assistant
-// prose, ● tool calls. Structure lives in the frontmatter; prose lives in the body.
+// prose and tool calls. Structure lives in the frontmatter; prose lives in the body.
 func renderTurnFile(turnNo int, events []event, ws *workingSet) string {
 	var fm, body strings.Builder
 	fm.WriteString("---\n")
@@ -110,7 +110,7 @@ func writeAssistantBody(body *strings.Builder, m *anthropic.Message, ws *working
 // renderCallLine renders one tool call as a decorative, human-readable line. The
 // resume parser ignores these — the authoritative calls are the frontmatter refs.
 func renderCallLine(v anthropic.ToolUseBlock, ws *workingSet) string {
-	line := fmt.Sprintf("● %s(%s)", v.Name, shortInput(v.Input))
+	line := fmt.Sprintf("⏺ %s(%s)", v.Name, shortInput(v.Input))
 	en := ws.get(v.ID)
 	if en == nil {
 		return line

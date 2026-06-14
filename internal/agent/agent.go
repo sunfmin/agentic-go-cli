@@ -199,12 +199,9 @@ func New(model Model, getUserMessage func() (string, bool), tools []tool.ToolDef
 }
 
 func (a *Agent) Run(ctx context.Context) error {
-	fmt.Println("Chat with Claude (ctrl-c to quit)")
-
 	readUserInput := true
 	for {
 		if readUserInput {
-			fmt.Print("\x1b[2m❯\x1b[0m ")
 			userInput, ok := a.getUserMessage()
 			if !ok {
 				break
@@ -224,7 +221,7 @@ func (a *Agent) Run(ctx context.Context) error {
 		for _, block := range message.Content {
 			switch variant := block.AsAny().(type) {
 			case anthropic.TextBlock:
-				fmt.Printf("⏺ %s\n", variant.Text)
+				ui.PrintAssistant(variant.Text)
 			case anthropic.ToolUseBlock:
 				content, isErr := a.handleTool(variant.Name, []byte(variant.Input))
 				a.ws.put(a.record(variant.ID, variant.Name, []byte(variant.Input), content, isErr))

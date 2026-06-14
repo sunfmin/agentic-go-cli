@@ -593,7 +593,7 @@ func TestTurnFileWrittenWithFrontmatterAndBody(t *testing.T) {
 		}
 	}
 	// Body: readable transcript with the terminal's markers.
-	for _, want := range []string{"❯ what changed?", "⏺ checking", "● run(echo hi)", "⏺ all done"} {
+	for _, want := range []string{"❯ what changed?", "⏺ checking", "⏺ run(echo hi)", "⏺ all done"} {
 		if !strings.Contains(s, want) {
 			t.Fatalf("body missing %q:\n%s", want, s)
 		}

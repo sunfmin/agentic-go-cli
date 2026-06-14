@@ -305,6 +305,51 @@ func TestDescribeFallsBackToCommandLabel(t *testing.T) {
 	}
 }
 
+func TestSessionPersistedToDisk(t *testing.T) {
+	fm := &fakeModel{replies: []*anthropic.Message{
+		assistantMessage(t, `{"role":"assistant","content":[{"type":"tool_use","id":"c1","name":"run","input":{"command":"echo hi"}}]}`),
+		assistantMessage(t, `{"role":"assistant","content":[{"type":"tool_use","id":"d1","name":"describe","input":{"ref":"#1","gist":"printed hi"}}]}`),
+		assistantMessage(t, `{"role":"assistant","content":[{"type":"text","text":"done"}]}`),
+	}}
+
+	a := New(fm, scriptedInput("go"), []tool.ToolDefinition{tool.RunDefinition, tool.DescribeDefinition})
+	a.artifactsDir = t.TempDir()
+	if err := a.Run(context.Background()); err != nil {
+		t.Fatalf("run: %v", err)
+	}
+
+	data, err := os.ReadFile(filepath.Join(a.artifactsDir, sessionFileName))
+	if err != nil {
+		t.Fatalf("session file not written: %v", err)
+	}
+	var st sessionState
+	if err := json.Unmarshal(data, &st); err != nil {
+		t.Fatalf("session JSON: %v", err)
+	}
+
+	if len(st.EventLog) == 0 {
+		t.Fatalf("event log not persisted")
+	}
+	var runEntry *entryState
+	for i := range st.WorkingSet {
+		if st.WorkingSet[i].ID == "c1" {
+			runEntry = &st.WorkingSet[i]
+		}
+	}
+	if runEntry == nil || runEntry.Kind != "run" {
+		t.Fatalf("working set missing the run entry")
+	}
+	found := false
+	for _, line := range st.Manifest {
+		if strings.Contains(line, "printed hi") {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("manifest does not reflect the gist; got %v", st.Manifest)
+	}
+}
+
 func TestLoopForgetRemovesEntryFromPayload(t *testing.T) {
 	fm := &fakeModel{replies: []*anthropic.Message{
 		assistantMessage(t, `{"role":"assistant","content":[{"type":"tool_use","id":"c1","name":"run","input":{"command":"echo X"}}]}`),

@@ -222,10 +222,13 @@ func (a *Agent) Run(ctx context.Context) error {
 		}
 		if len(ids) == 0 {
 			readUserInput = true
-			continue
+		} else {
+			a.events = append(a.events, event{kind: evToolResults, ids: ids})
+			readUserInput = false
 		}
-		a.events = append(a.events, event{kind: evToolResults, ids: ids})
-		readUserInput = false
+		if err := a.persist(); err != nil {
+			fmt.Fprintln(os.Stderr, "warning: failed to persist session:", err)
+		}
 	}
 	return nil
 }
@@ -384,18 +387,31 @@ func (a *Agent) record(id, toolName string, input []byte, content string, isErr 
 	return e
 }
 
-// writeArtifact persists content to a new file in the Artifacts directory
-// (created lazily) and returns its path.
-func (a *Agent) writeArtifact(content string) (string, error) {
+// artifactsDirName is the directory, relative to the working directory, where
+// run Artifacts are persisted.
+const artifactsDirName = ".agentic-artifacts"
+
+// ensureDir lazily creates the agent's on-disk state directory (a fixed
+// subdirectory of the working directory) and returns its path.
+func (a *Agent) ensureDir() (string, error) {
 	if a.artifactsDir == "" {
-		dir, err := os.MkdirTemp("", "agentic-artifacts-")
-		if err != nil {
+		if err := os.MkdirAll(artifactsDirName, 0o755); err != nil {
 			return "", err
 		}
-		a.artifactsDir = dir
+		a.artifactsDir = artifactsDirName
+	}
+	return a.artifactsDir, nil
+}
+
+// writeArtifact persists content to a new file in the state directory and
+// returns its path.
+func (a *Agent) writeArtifact(content string) (string, error) {
+	dir, err := a.ensureDir()
+	if err != nil {
+		return "", err
 	}
 	a.artifactSeq++
-	p := filepath.Join(a.artifactsDir, fmt.Sprintf("run-%d.txt", a.artifactSeq))
+	p := filepath.Join(dir, fmt.Sprintf("run-%d.txt", a.artifactSeq))
 	if err := os.WriteFile(p, []byte(content), 0o644); err != nil {
 		return "", err
 	}

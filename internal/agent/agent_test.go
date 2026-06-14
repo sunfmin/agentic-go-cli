@@ -96,7 +96,7 @@ func TestBuildPayloadLatestResultFull(t *testing.T) {
 		{kind: evToolResults, ids: []string{"t1"}},
 	}
 
-	payload := buildPayload(events, ws)
+	payload := buildPayload(events, ws, nil)
 	if len(payload) != 3 {
 		t.Fatalf("payload has %d messages, want 3", len(payload))
 	}
@@ -120,7 +120,7 @@ func TestBuildPayloadCollapsesOlderResults(t *testing.T) {
 		{kind: evToolResults, ids: []string{"b"}},
 	}
 
-	payload := buildPayload(events, ws)
+	payload := buildPayload(events, ws, nil)
 	// The older result's description lives in the standalone Manifest now; its
 	// tool_result position keeps only a pointer.
 	if got := findToolResult(payload, "a"); strings.Contains(got, "go build") {
@@ -148,7 +148,7 @@ func TestBuildPayloadCollapsedReadIsLiveReference(t *testing.T) {
 		{kind: evToolResults, ids: []string{"r2"}},
 	}
 
-	payload := buildPayload(events, ws)
+	payload := buildPayload(events, ws, nil)
 	// The collapsed read is a live reference in the Manifest — never its stale content.
 	if !payloadContains(payload, "[#1 read main.go @turn 2 — re-read for current contents]") {
 		t.Fatalf("Manifest missing the live read reference")
@@ -262,7 +262,7 @@ func TestBuildPayloadForgetDropsBothHalves(t *testing.T) {
 		{kind: evToolResults, ids: []string{"b"}},
 	}
 
-	payload := buildPayload(events, ws)
+	payload := buildPayload(events, ws, nil)
 	if hasToolUse(payload, "a") {
 		t.Fatalf("forgotten tool_use 'a' is still present")
 	}
@@ -314,8 +314,51 @@ func TestDescribeFallsBackToCommandLabel(t *testing.T) {
 		{kind: evAssistant, asst: a2},
 		{kind: evToolResults, ids: []string{"b"}},
 	}
-	if !payloadContains(buildPayload(events, ws), "run: go vet") {
+	if !payloadContains(buildPayload(events, ws, nil), "run: go vet") {
 		t.Fatalf("undescribed run should fall back to the command label in the Manifest")
+	}
+}
+
+func TestOldTurnsCollapseToSynopsis(t *testing.T) {
+	// Three Turns; with the window of 2, Turn 1 collapses on the Turn-3 request.
+	fm := &fakeModel{replies: []*anthropic.Message{
+		assistantMessage(t, `{"role":"assistant","content":[{"type":"text","text":"checking"},{"type":"tool_use","id":"c1","name":"run","input":{"command":"echo one"}}]}`),
+		assistantMessage(t, `{"role":"assistant","content":[{"type":"text","text":"did one"}]}`),
+		assistantMessage(t, `{"role":"assistant","content":[{"type":"text","text":"answer two"}]}`),
+		assistantMessage(t, `{"role":"assistant","content":[{"type":"text","text":"answer three"}]}`),
+	}}
+	a := New(fm, scriptedInput("first question", "second question", "third question"),
+		[]tool.ToolDefinition{tool.RunDefinition})
+	a.sessionDir = t.TempDir()
+	if err := a.Run(context.Background()); err != nil {
+		t.Fatalf("run: %v", err)
+	}
+
+	// The model call for Turn 3 is the last one.
+	last := fm.calls[len(fm.calls)-1]
+
+	// Turn 1 is collapsed: a one-line synopsis pointing at its transcript, with
+	// its tool plumbing dropped entirely.
+	if !payloadContains(last, "Turn 1") || !payloadContains(last, turnPath(1)) {
+		t.Fatalf("Turn 1 should collapse to a synopsis pointing at its transcript")
+	}
+	if hasToolUse(last, "c1") {
+		t.Fatalf("collapsed Turn 1 still carries its tool_use plumbing")
+	}
+	// Its prompt is kept verbatim; the bootstrap description is the prompt's first line.
+	if !payloadContains(last, "first question") {
+		t.Fatalf("collapsed Turn should keep its user prompt verbatim")
+	}
+	// Recent Turns (2 and 3) are still present in full.
+	if !payloadContains(last, "second question") || !payloadContains(last, "answer two") {
+		t.Fatalf("recent Turn 2 should remain full")
+	}
+	if !payloadContains(last, "third question") {
+		t.Fatalf("current Turn 3 prompt should be present")
+	}
+	// The collapsed Turn's live Artifact is still recallable via the Manifest.
+	if !payloadContains(last, "echo one") {
+		t.Fatalf("collapsed Turn's Artifact should still be listed in the Manifest")
 	}
 }
 
@@ -332,7 +375,7 @@ func TestManifestIsStandaloneBlock(t *testing.T) {
 		{kind: evAssistant, asst: a2},
 		{kind: evToolResults, ids: []string{"b"}},
 	}
-	payload := buildPayload(events, ws)
+	payload := buildPayload(events, ws, nil)
 
 	// The Manifest is exactly one standalone text block.
 	manifestBlocks := 0

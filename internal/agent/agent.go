@@ -211,7 +211,7 @@ func (a *Agent) Run(ctx context.Context) error {
 			a.events = append(a.events, event{kind: evUser, text: userInput})
 		}
 
-		message, err := a.model.Next(ctx, buildPayload(a.events, a.ws), a.toolParams())
+		message, err := a.model.Next(ctx, buildPayload(a.events, a.ws, nil), a.toolParams())
 		if err != nil {
 			return err
 		}
@@ -249,14 +249,30 @@ func (a *Agent) Run(ctx context.Context) error {
 // and the working set. Only the most recent tool result is sent in full; every
 // older tool result collapses to its one-line Manifest entry, while keeping the
 // tool_use/tool_result pairing intact so the request stays valid.
-func buildPayload(events []event, ws *workingSet) []anthropic.MessageParam {
+func buildPayload(events []event, ws *workingSet, turnDesc map[int]string) []anthropic.MessageParam {
 	// The latest results are full only when they are literally the last thing in
 	// the log — i.e. the model is about to respond to them. Once a user or
 	// assistant turn follows, they too collapse into the Manifest.
 	latest := latestIDs(events)
+	totalTurns := countTurns(events)
 
 	out := []anthropic.MessageParam{}
+	curTurn := 0
 	for _, e := range events {
+		if e.kind == evUser {
+			curTurn++
+		}
+		// Turns older than the most recent few collapse to a one-line synopsis,
+		// and their tool_use/tool_result plumbing is dropped wholesale. The live
+		// Artifacts they produced stay listed in the Manifest, recallable, and
+		// the full exchange is recalled by reading the Turn's transcript.
+		if curTurn <= totalTurns-fullTurnWindow {
+			if e.kind == evUser {
+				out = append(out, anthropic.NewUserMessage(anthropic.NewTextBlock(e.text)))
+				out = append(out, anthropic.NewAssistantMessage(anthropic.NewTextBlock(turnSynopsis(curTurn, e.text, turnDesc))))
+			}
+			continue
+		}
 		switch e.kind {
 		case evUser:
 			out = append(out, anthropic.NewUserMessage(anthropic.NewTextBlock(e.text)))
@@ -312,6 +328,45 @@ func buildPayload(events []event, ws *workingSet) []anthropic.MessageParam {
 		}
 	}
 	return out
+}
+
+// fullTurnWindow is how many of the most recent Turns are sent in full; older
+// Turns collapse to a one-line synopsis the model can recall on demand.
+const fullTurnWindow = 2
+
+// countTurns counts the user prompts in the log — one per Turn.
+func countTurns(events []event) int {
+	n := 0
+	for _, e := range events {
+		if e.kind == evUser {
+			n++
+		}
+	}
+	return n
+}
+
+// turnSynopsis is the one-line stand-in for a collapsed Turn's whole reply. It
+// bootstraps from the prompt's first line and is upgraded by an explicit
+// describe (carried in turnDesc); either way it points at the Turn's transcript
+// so the model can recall the full exchange.
+func turnSynopsis(turn int, prompt string, turnDesc map[int]string) string {
+	desc := firstLine(prompt)
+	if d, ok := turnDesc[turn]; ok && strings.TrimSpace(d) != "" {
+		desc = d
+	}
+	return fmt.Sprintf("[Turn %d — %s — recall the full exchange: read %s]", turn, desc, turnPath(turn))
+}
+
+// turnPath is the transcript file for a Turn, relative to the Session directory.
+func turnPath(turn int) string {
+	return fmt.Sprintf("turns/%03d.md", turn)
+}
+
+func firstLine(s string) string {
+	if i := strings.IndexByte(s, '\n'); i >= 0 {
+		s = s[:i]
+	}
+	return strings.TrimSpace(s)
 }
 
 // latestIDs returns the tool_use IDs whose results are the last thing in the

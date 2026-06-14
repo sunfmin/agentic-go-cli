@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/anthropics/anthropic-sdk-go"
@@ -48,6 +49,23 @@ func toolResultText(m anthropic.MessageParam) string {
 	return ""
 }
 
+// findToolResult returns the text of the tool_result with the given tool_use ID
+// across a whole payload, or "" if absent.
+func findToolResult(payload []anthropic.MessageParam, id string) string {
+	for _, m := range payload {
+		for _, b := range m.Content {
+			if b.OfToolResult != nil && b.OfToolResult.ToolUseID == id {
+				for _, c := range b.OfToolResult.Content {
+					if c.OfText != nil {
+						return c.OfText.Text
+					}
+				}
+			}
+		}
+	}
+	return ""
+}
+
 func scriptedInput(inputs ...string) func() (string, bool) {
 	i := 0
 	return func() (string, bool) {
@@ -67,9 +85,9 @@ func writeFile(t *testing.T, path, content string) {
 	}
 }
 
-func TestBuildPayloadIdentity(t *testing.T) {
+func TestBuildPayloadLatestResultFull(t *testing.T) {
 	ws := newWorkingSet()
-	ws.put(&entry{id: "t1", content: "file contents here"})
+	ws.put(&entry{id: "t1", kind: kindRead, path: "main.go", content: "file contents here"})
 
 	asst := assistantMessage(t, `{"role":"assistant","content":[{"type":"tool_use","id":"t1","name":"read","input":{"path":"main.go"}}]}`)
 	events := []event{
@@ -84,6 +102,77 @@ func TestBuildPayloadIdentity(t *testing.T) {
 	}
 	if got := toolResultText(payload[2]); got != "file contents here" {
 		t.Fatalf("tool result = %q, want the full content", got)
+	}
+}
+
+func TestBuildPayloadCollapsesOlderResults(t *testing.T) {
+	ws := newWorkingSet()
+	ws.put(&entry{id: "a", kind: kindRun, name: "run", desc: "run: go build", content: "lots of build output"})
+	ws.put(&entry{id: "b", kind: kindRun, name: "run", desc: "run: go test", content: "FRESH test output"})
+
+	a1 := assistantMessage(t, `{"role":"assistant","content":[{"type":"tool_use","id":"a","name":"run","input":{"command":"go build"}}]}`)
+	a2 := assistantMessage(t, `{"role":"assistant","content":[{"type":"tool_use","id":"b","name":"run","input":{"command":"go test"}}]}`)
+	events := []event{
+		{kind: evUser, text: "build then test"},
+		{kind: evAssistant, asst: a1},
+		{kind: evToolResults, ids: []string{"a"}},
+		{kind: evAssistant, asst: a2},
+		{kind: evToolResults, ids: []string{"b"}},
+	}
+
+	payload := buildPayload(events, ws)
+	if got := findToolResult(payload, "a"); got != "[run — run: go build]" {
+		t.Fatalf("older result = %q, want the collapsed Manifest line", got)
+	}
+	if got := findToolResult(payload, "b"); got != "FRESH test output" {
+		t.Fatalf("latest result = %q, want the full content", got)
+	}
+}
+
+func TestBuildPayloadCollapsedReadIsLiveReference(t *testing.T) {
+	ws := newWorkingSet()
+	ws.put(&entry{id: "r1", kind: kindRead, path: "main.go", turn: 2, content: "OLD CONTENT MUST NOT APPEAR"})
+	ws.put(&entry{id: "r2", kind: kindRead, path: "other.go", turn: 5, content: "fresh"})
+
+	a1 := assistantMessage(t, `{"role":"assistant","content":[{"type":"tool_use","id":"r1","name":"read","input":{"path":"main.go"}}]}`)
+	a2 := assistantMessage(t, `{"role":"assistant","content":[{"type":"tool_use","id":"r2","name":"read","input":{"path":"other.go"}}]}`)
+	events := []event{
+		{kind: evAssistant, asst: a1},
+		{kind: evToolResults, ids: []string{"r1"}},
+		{kind: evAssistant, asst: a2},
+		{kind: evToolResults, ids: []string{"r2"}},
+	}
+
+	payload := buildPayload(events, ws)
+	ref := findToolResult(payload, "r1")
+	if ref != "[read main.go @turn 2 — re-read for current contents]" {
+		t.Fatalf("collapsed read = %q, want a live reference", ref)
+	}
+	if strings.Contains(ref, "OLD CONTENT") {
+		t.Fatalf("collapsed read leaked stale content: %q", ref)
+	}
+}
+
+func TestLoopCollapsesPriorRunResult(t *testing.T) {
+	fm := &fakeModel{replies: []*anthropic.Message{
+		assistantMessage(t, `{"role":"assistant","content":[{"type":"tool_use","id":"c1","name":"run","input":{"command":"echo AAAA"}}]}`),
+		assistantMessage(t, `{"role":"assistant","content":[{"type":"tool_use","id":"c2","name":"run","input":{"command":"echo BBBB"}}]}`),
+		assistantMessage(t, `{"role":"assistant","content":[{"type":"text","text":"done"}]}`),
+	}}
+
+	a := New(fm, scriptedInput("go"), []tool.ToolDefinition{tool.ReadDefinition, tool.EditDefinition, tool.RunDefinition})
+	if err := a.Run(context.Background()); err != nil {
+		t.Fatalf("run: %v", err)
+	}
+	if len(fm.calls) < 3 {
+		t.Fatalf("model called %d times, want >= 3", len(fm.calls))
+	}
+	third := fm.calls[2]
+	if got := findToolResult(third, "c1"); got != "[run — run: echo AAAA]" {
+		t.Fatalf("prior run result = %q, want collapsed", got)
+	}
+	if got := findToolResult(third, "c2"); got != "BBBB\n" {
+		t.Fatalf("latest run result = %q, want full output", got)
 	}
 }
 

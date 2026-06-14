@@ -107,8 +107,8 @@ func TestBuildPayloadLatestResultFull(t *testing.T) {
 
 func TestBuildPayloadCollapsesOlderResults(t *testing.T) {
 	ws := newWorkingSet()
-	ws.put(&entry{id: "a", kind: kindRun, name: "run", desc: "run: go build", content: "lots of build output"})
-	ws.put(&entry{id: "b", kind: kindRun, name: "run", desc: "run: go test", content: "FRESH test output"})
+	ws.put(&entry{id: "a", ref: "#1", kind: kindRun, name: "run", desc: "run: go build", content: "lots of build output"})
+	ws.put(&entry{id: "b", ref: "#2", kind: kindRun, name: "run", desc: "run: go test", content: "FRESH test output"})
 
 	a1 := assistantMessage(t, `{"role":"assistant","content":[{"type":"tool_use","id":"a","name":"run","input":{"command":"go build"}}]}`)
 	a2 := assistantMessage(t, `{"role":"assistant","content":[{"type":"tool_use","id":"b","name":"run","input":{"command":"go test"}}]}`)
@@ -121,8 +121,13 @@ func TestBuildPayloadCollapsesOlderResults(t *testing.T) {
 	}
 
 	payload := buildPayload(events, ws)
-	if got := findToolResult(payload, "a"); got != "[run: go build]" {
-		t.Fatalf("older result = %q, want the collapsed Manifest line", got)
+	// The older result's description lives in the standalone Manifest now; its
+	// tool_result position keeps only a pointer.
+	if got := findToolResult(payload, "a"); strings.Contains(got, "go build") {
+		t.Fatalf("older result position should be a pointer, not the description: %q", got)
+	}
+	if !payloadContains(payload, "run: go build") {
+		t.Fatalf("standalone Manifest is missing the older entry's description")
 	}
 	if got := findToolResult(payload, "b"); got != "FRESH test output" {
 		t.Fatalf("latest result = %q, want the full content", got)
@@ -131,8 +136,8 @@ func TestBuildPayloadCollapsesOlderResults(t *testing.T) {
 
 func TestBuildPayloadCollapsedReadIsLiveReference(t *testing.T) {
 	ws := newWorkingSet()
-	ws.put(&entry{id: "r1", kind: kindRead, path: "main.go", turn: 2, content: "OLD CONTENT MUST NOT APPEAR"})
-	ws.put(&entry{id: "r2", kind: kindRead, path: "other.go", turn: 5, content: "fresh"})
+	ws.put(&entry{id: "r1", ref: "#1", kind: kindRead, path: "main.go", turn: 2, content: "OLD CONTENT MUST NOT APPEAR"})
+	ws.put(&entry{id: "r2", ref: "#2", kind: kindRead, path: "other.go", turn: 5, content: "fresh"})
 
 	a1 := assistantMessage(t, `{"role":"assistant","content":[{"type":"tool_use","id":"r1","name":"read","input":{"path":"main.go"}}]}`)
 	a2 := assistantMessage(t, `{"role":"assistant","content":[{"type":"tool_use","id":"r2","name":"read","input":{"path":"other.go"}}]}`)
@@ -144,12 +149,15 @@ func TestBuildPayloadCollapsedReadIsLiveReference(t *testing.T) {
 	}
 
 	payload := buildPayload(events, ws)
-	ref := findToolResult(payload, "r1")
-	if ref != "[read main.go @turn 2 — re-read for current contents]" {
-		t.Fatalf("collapsed read = %q, want a live reference", ref)
+	// The collapsed read is a live reference in the Manifest — never its stale content.
+	if !payloadContains(payload, "[#1 read main.go @turn 2 — re-read for current contents]") {
+		t.Fatalf("Manifest missing the live read reference")
 	}
-	if strings.Contains(ref, "OLD CONTENT") {
-		t.Fatalf("collapsed read leaked stale content: %q", ref)
+	if payloadContains(payload, "OLD CONTENT") {
+		t.Fatalf("collapsed read leaked stale content")
+	}
+	if got := findToolResult(payload, "r1"); strings.Contains(got, "main.go") {
+		t.Fatalf("older read position should be a bare pointer, not the reference: %q", got)
 	}
 }
 
@@ -169,8 +177,11 @@ func TestLoopCollapsesPriorRunResult(t *testing.T) {
 		t.Fatalf("model called %d times, want >= 3", len(fm.calls))
 	}
 	third := fm.calls[2]
-	if got := findToolResult(third, "c1"); !strings.Contains(got, "run: echo AAAA") || got == "AAAA\n" {
-		t.Fatalf("prior run result = %q, want collapsed Manifest line", got)
+	if !payloadContains(third, "run: echo AAAA") {
+		t.Fatalf("third payload's Manifest is missing the prior run description")
+	}
+	if got := findToolResult(third, "c1"); strings.Contains(got, "echo AAAA") {
+		t.Fatalf("prior run result position should be a pointer, not the description: %q", got)
 	}
 	if got := findToolResult(third, "c2"); got != "BBBB\n" {
 		t.Fatalf("latest run result = %q, want full output", got)
@@ -282,12 +293,11 @@ func TestLoopDescribeReplacesRunLabelWithGist(t *testing.T) {
 	}
 
 	last := fm.calls[len(fm.calls)-1]
-	got := findToolResult(last, "c1")
-	if !strings.Contains(got, "echoed the data") {
-		t.Fatalf("collapsed run = %q, want it to show the gist", got)
+	if !payloadContains(last, "echoed the data") {
+		t.Fatalf("Manifest should show the gist after describe")
 	}
-	if strings.Contains(got, "run: echo data") {
-		t.Fatalf("collapsed run = %q, should no longer show the command label", got)
+	if payloadContains(last, "run: echo data") {
+		t.Fatalf("Manifest should no longer show the command label after describe")
 	}
 }
 
@@ -304,8 +314,48 @@ func TestDescribeFallsBackToCommandLabel(t *testing.T) {
 		{kind: evAssistant, asst: a2},
 		{kind: evToolResults, ids: []string{"b"}},
 	}
-	if got := findToolResult(buildPayload(events, ws), "a"); !strings.Contains(got, "run: go vet") {
-		t.Fatalf("undescribed run = %q, want the command label fallback", got)
+	if !payloadContains(buildPayload(events, ws), "run: go vet") {
+		t.Fatalf("undescribed run should fall back to the command label in the Manifest")
+	}
+}
+
+func TestManifestIsStandaloneBlock(t *testing.T) {
+	ws := newWorkingSet()
+	ws.put(&entry{id: "a", ref: "#1", kind: kindRun, name: "run", desc: "run: go build", content: "old build output"})
+	ws.put(&entry{id: "b", ref: "#2", kind: kindRun, name: "run", desc: "run: go test", content: "latest test output"})
+	a1 := assistantMessage(t, `{"role":"assistant","content":[{"type":"tool_use","id":"a","name":"run","input":{"command":"go build"}}]}`)
+	a2 := assistantMessage(t, `{"role":"assistant","content":[{"type":"tool_use","id":"b","name":"run","input":{"command":"go test"}}]}`)
+	events := []event{
+		{kind: evUser, text: "build then test"},
+		{kind: evAssistant, asst: a1},
+		{kind: evToolResults, ids: []string{"a"}},
+		{kind: evAssistant, asst: a2},
+		{kind: evToolResults, ids: []string{"b"}},
+	}
+	payload := buildPayload(events, ws)
+
+	// The Manifest is exactly one standalone text block.
+	manifestBlocks := 0
+	for _, m := range payload {
+		for _, blk := range m.Content {
+			if blk.OfText != nil && strings.Contains(blk.OfText.Text, "Working Set") {
+				manifestBlocks++
+			}
+		}
+	}
+	if manifestBlocks != 1 {
+		t.Fatalf("want exactly one standalone Manifest block, got %d", manifestBlocks)
+	}
+	// The collapsed description lives in the Manifest, not in any tool_result.
+	if got := findToolResult(payload, "a"); strings.Contains(got, "go build") {
+		t.Fatalf("tool_result still carries the collapsed Manifest line: %q", got)
+	}
+	if !payloadContains(payload, "run: go build") {
+		t.Fatalf("Manifest is missing the older entry's description")
+	}
+	// The latest result is still full inline (and excluded from the Manifest).
+	if got := findToolResult(payload, "b"); got != "latest test output" {
+		t.Fatalf("latest result = %q, want the full content", got)
 	}
 }
 

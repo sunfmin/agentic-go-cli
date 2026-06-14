@@ -253,12 +253,7 @@ func buildPayload(events []event, ws *workingSet) []anthropic.MessageParam {
 	// The latest results are full only when they are literally the last thing in
 	// the log — i.e. the model is about to respond to them. Once a user or
 	// assistant turn follows, they too collapse into the Manifest.
-	latest := map[string]bool{}
-	if n := len(events); n > 0 && events[n-1].kind == evToolResults {
-		for _, id := range events[n-1].ids {
-			latest[id] = true
-		}
-	}
+	latest := latestIDs(events)
 
 	out := []anthropic.MessageParam{}
 	for _, e := range events {
@@ -295,7 +290,9 @@ func buildPayload(events []event, ws *workingSet) []anthropic.MessageParam {
 				if latest[id] {
 					blocks = append(blocks, anthropic.NewToolResultBlock(id, en.content, en.isErr))
 				} else {
-					blocks = append(blocks, anthropic.NewToolResultBlock(id, en.manifestLine(), false))
+					// The description has moved to the standalone Manifest; the
+					// result position keeps only a pointer so pairing stays valid.
+					blocks = append(blocks, anthropic.NewToolResultBlock(id, collapsedPointer(en), false))
 				}
 			}
 			if len(blocks) > 0 {
@@ -303,7 +300,56 @@ func buildPayload(events []event, ws *workingSet) []anthropic.MessageParam {
 			}
 		}
 	}
+
+	// The Manifest is its own always-current section rather than woven into the
+	// tool_result positions. Attach it to the active prompt (the last message is
+	// always a user message when the model is about to respond).
+	if mani := manifestText(ws, latest); mani != "" {
+		if n := len(out); n > 0 && out[n-1].Role == anthropic.MessageParamRoleUser {
+			out[n-1].Content = append(out[n-1].Content, anthropic.NewTextBlock(mani))
+		} else {
+			out = append(out, anthropic.NewUserMessage(anthropic.NewTextBlock(mani)))
+		}
+	}
 	return out
+}
+
+// latestIDs returns the tool_use IDs whose results are the last thing in the
+// log, so they are sent in full instead of collapsing into the Manifest.
+func latestIDs(events []event) map[string]bool {
+	latest := map[string]bool{}
+	if n := len(events); n > 0 && events[n-1].kind == evToolResults {
+		for _, id := range events[n-1].ids {
+			latest[id] = true
+		}
+	}
+	return latest
+}
+
+// collapsedPointer is the minimal content left in a collapsed result's
+// tool_result position — just enough to point at its Manifest entry.
+func collapsedPointer(en *entry) string {
+	if en.ref != "" {
+		return en.ref + " (see Working Set)"
+	}
+	return "(see Working Set)"
+}
+
+// manifestText renders the standalone Manifest: one line per live, non-latest
+// entry, by which the model decides whether to recall an entry's full content.
+func manifestText(ws *workingSet, latest map[string]bool) string {
+	var lines []string
+	for _, id := range ws.order {
+		en := ws.byID[id]
+		if en.forgotten || latest[id] {
+			continue
+		}
+		lines = append(lines, en.manifestLine())
+	}
+	if len(lines) == 0 {
+		return ""
+	}
+	return "Working Set — older results are listed here; recall one by reading its file:\n" + strings.Join(lines, "\n")
 }
 
 func (a *Agent) toolParams() []anthropic.ToolUnionParam {

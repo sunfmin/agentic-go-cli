@@ -27,10 +27,17 @@ func main() {
 		os.Exit(1)
 	}
 
-	client := anthropic.NewClient(
+	opts := []option.RequestOption{
 		option.WithAuthToken(token),
 		option.WithHeader("anthropic-beta", "oauth-2025-04-20"),
-	)
+	}
+	// An explicit base URL (ANTHROPIC_BASE_URL) lets requests be pointed at a
+	// proxy or gateway; unset means the SDK default endpoint.
+	if base := os.Getenv("ANTHROPIC_BASE_URL"); base != "" {
+		opts = append(opts, option.WithBaseURL(base))
+	}
+
+	client := anthropic.NewClient(opts...)
 
 	a := agent.New(
 		agent.NewAnthropicModel(&client),
@@ -73,9 +80,16 @@ func main() {
 	}
 }
 
-// claudeCodeToken reads the OAuth access token Claude Code stores in the
-// macOS Keychain (falling back to ~/.claude/.credentials.json on Linux).
+// claudeCodeToken resolves the auth token used for the Anthropic API. An
+// environment variable takes precedence (ANTHROPIC_AUTH_TOKEN, or the common
+// ANTHROPIC_API_KEY), letting the token be injected without touching the
+// Keychain. Failing that, it reads the OAuth access token Claude Code stores in
+// the macOS Keychain (falling back to ~/.claude/.credentials.json on Linux).
 func claudeCodeToken() (string, error) {
+	if t := firstNonEmptyEnv("ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY"); t != "" {
+		return t, nil
+	}
+
 	var raw []byte
 	out, err := exec.Command("security", "find-generic-password", "-s", "Claude Code-credentials", "-w").Output()
 	if err == nil {
@@ -96,7 +110,18 @@ func claudeCodeToken() (string, error) {
 		return "", err
 	}
 	if creds.ClaudeAiOauth.AccessToken == "" {
-		return "", fmt.Errorf("no accessToken found — run `claude` and /login first")
+		return "", fmt.Errorf("no accessToken found — set ANTHROPIC_AUTH_TOKEN, or run `claude` and /login first")
 	}
 	return creds.ClaudeAiOauth.AccessToken, nil
+}
+
+// firstNonEmptyEnv returns the value of the first environment variable in names
+// that is set to a non-empty value, or "" if none are.
+func firstNonEmptyEnv(names ...string) string {
+	for _, name := range names {
+		if v := os.Getenv(name); v != "" {
+			return v
+		}
+	}
+	return ""
 }

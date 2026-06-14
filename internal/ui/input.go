@@ -6,12 +6,24 @@ import (
 	"os"
 	"strings"
 
+	"github.com/mattn/go-runewidth"
 	"golang.org/x/term"
 )
 
 // stdin is a single buffered reader over os.Stdin, shared by the raw-mode line
 // editor and the non-TTY fallback so no typed bytes are lost between reads.
 var stdin = bufio.NewReader(os.Stdin)
+
+// Raw ANSI for the input editor. It writes cursor-position escapes directly to
+// stdout (never through render.go's colorprofile writer, which strips them), so
+// its colours are inline SGR sequences rather than lipgloss styles.
+const (
+	reset     = "\x1b[0m"
+	dim       = "\x1b[2m"
+	railSeq   = "\x1b[38;2;90;99;115m" // cRail, the box border
+	accentSeq = "\x1b[38;2;0;173;216m" // cAccent (Go cyan), the prompt glyph
+	metaSeq   = dim                    // the footer hint
+)
 
 // ReadInput draws the input prompt and returns the next line the user enters,
 // reporting false on EOF / Ctrl-C / Ctrl-D.
@@ -23,8 +35,10 @@ var stdin = bufio.NewReader(os.Stdin)
 // half of every two-column glyph on screen. Off a TTY it falls back to a plain
 // prompt and a buffered line read.
 func ReadInput() (string, bool) {
+	// A new prompt ends the previous reply's rail, so the next reply starts fresh.
+	closeRail()
 	if !isTTY() {
-		fmt.Print(dim + "❯" + reset + " ")
+		fmt.Print(accentSeq + glyphPrompt + reset + " ")
 		return readLineCooked()
 	}
 	return readLineRaw()
@@ -44,15 +58,17 @@ func readLineRaw() (string, bool) {
 	fd := int(os.Stdin.Fd())
 	old, err := term.MakeRaw(fd)
 	if err != nil {
-		fmt.Print("\n" + dim + "❯" + reset + " ")
+		fmt.Print("\n" + accentSeq + glyphPrompt + reset + " ")
 		return readLineCooked()
 	}
 	defer term.Restore(fd, old)
 
 	bw := boxWidth()
 	bar := strings.Repeat("─", max(0, bw-2))
-	// Leading blank line, top border, then the (empty) prompt row.
-	fmt.Printf("\r\n%s╭%s╮%s\r\n", dim, bar, reset)
+	// A blank line, the Working Set + shortcuts footer, the top border, then the
+	// (empty) prompt row. The footer sits above the box so the in-place line
+	// editor below it can repaint without disturbing it.
+	fmt.Printf("\r\n%s\r\n%s╭%s╮%s\r\n", statusLine(bw), railSeq, bar, reset)
 	var buf []rune
 	drawInputRow(buf, bw)
 
@@ -97,22 +113,36 @@ func drawInputRow(buf []rune, bw int) {
 }
 
 // inputRow is the control sequence that paints the prompt row for buf: carriage
-// return to column 1, the "│ ❯ " prefix and buffer, padding spaces that overwrite
-// any leftover glyphs out to the right border, then the cursor parked at the
-// logical end of the input.
+// return to column 1, the "│ › " prefix (rail border, Go-cyan prompt) and buffer,
+// padding spaces that overwrite any leftover glyphs out to the right border, then
+// the cursor parked at the logical end of the input. The prefix is four columns
+// wide, so the buffer (and the cursor) start at column five.
 func inputRow(buf []rune, bw int) string {
 	bufW := stringWidth(buf)
 	pad := max(0, bw-5-bufW)
-	return fmt.Sprintf("\r%s│%s ❯ %s%s%s│%s\x1b[%dG",
-		dim, reset, string(buf), strings.Repeat(" ", pad), dim, reset, 5+bufW)
+	return fmt.Sprintf("\r%s│%s %s%s%s %s%s%s│%s\x1b[%dG",
+		railSeq, reset, accentSeq, glyphPrompt, reset,
+		string(buf), strings.Repeat(" ", pad), railSeq, reset, 5+bufW)
 }
 
 // finish closes the box below the prompt row, leaving one blank line before the
 // response, and returns the edited line.
 func finish(buf []rune, bw int, ok bool) (string, bool) {
 	bar := strings.Repeat("─", max(0, bw-2))
-	fmt.Printf("\r\n%s╰%s╯%s\r\n\r\n", dim, bar, reset)
+	fmt.Printf("\r\n%s╰%s╯%s\r\n\r\n", railSeq, bar, reset)
 	return string(buf), ok
+}
+
+// statusLine is the dim footer shown above the input box. It surfaces the live
+// Working Set size — the thing that sets this agent apart from a plain chat loop —
+// alongside the key hints, so both stay in view while you type.
+func statusLine(bw int) string {
+	parts := make([]string, 0, 3)
+	if workingSetCount > 0 {
+		parts = append(parts, fmt.Sprintf("working set: %d", workingSetCount))
+	}
+	parts = append(parts, "⏎ send", "⌃C quit")
+	return metaSeq + " " + strings.Join(parts, "   ·   ") + reset
 }
 
 // consumeEscape discards the rest of an escape sequence (e.g. an arrow key)
@@ -134,47 +164,20 @@ func consumeEscape() {
 	}
 }
 
-// stringWidth is the display column count of a rune slice.
+// stringWidth is the display column count of a rune slice — what the repaint
+// uses to size padding and park the cursor. It delegates to go-runewidth (the
+// width table lipgloss itself uses), so a wide CJK / fullwidth / emoji rune
+// counts as two columns and stays consistent with render.go's measurements.
 func stringWidth(rs []rune) int {
-	w := 0
-	for _, r := range rs {
-		w += runeWidth(r)
-	}
-	return w
+	return runewidth.StringWidth(string(rs))
 }
 
 // runeWidth returns how many terminal columns a rune occupies: 0 for control
-// characters, 2 for wide (CJK / fullwidth / emoji) runes, 1 otherwise.
+// characters (which go-runewidth would otherwise count as one), and the
+// go-runewidth value — 2 for wide runes, 1 otherwise — for everything else.
 func runeWidth(r rune) int {
-	switch {
-	case r < 0x20:
+	if r < 0x20 {
 		return 0
-	case isWide(r):
-		return 2
-	default:
-		return 1
 	}
-}
-
-// isWide reports whether a rune is rendered two columns wide, covering the CJK,
-// Japanese, Korean, fullwidth, and emoji blocks that show up in practice.
-func isWide(r rune) bool {
-	switch {
-	case r >= 0x1100 && r <= 0x115F, // Hangul Jamo
-		r >= 0x2E80 && r <= 0x303E, // CJK radicals, Kangxi, punctuation
-		r >= 0x3041 && r <= 0x33FF, // Hiragana, Katakana, CJK symbols
-		r >= 0x3400 && r <= 0x4DBF, // CJK Extension A
-		r >= 0x4E00 && r <= 0x9FFF, // CJK Unified Ideographs
-		r >= 0xA000 && r <= 0xA4CF, // Yi
-		r >= 0xAC00 && r <= 0xD7A3, // Hangul Syllables
-		r >= 0xF900 && r <= 0xFAFF, // CJK Compatibility Ideographs
-		r >= 0xFE10 && r <= 0xFE19, // vertical forms
-		r >= 0xFE30 && r <= 0xFE6F, // CJK compatibility forms
-		r >= 0xFF00 && r <= 0xFF60, // fullwidth forms
-		r >= 0xFFE0 && r <= 0xFFE6, // fullwidth signs
-		r >= 0x1F300 && r <= 0x1FAFF, // emoji & symbols
-		r >= 0x20000 && r <= 0x3FFFD: // CJK Extension B and beyond
-		return true
-	}
-	return false
+	return runewidth.RuneWidth(r)
 }

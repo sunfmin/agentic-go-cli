@@ -3,15 +3,19 @@
 package agent
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
 	"time"
 
 	"github.com/anthropics/anthropic-sdk-go"
+	"github.com/anthropics/anthropic-sdk-go/option"
 	"github.com/sunfmin/agentic-go-cli/internal/tool"
 	"github.com/sunfmin/agentic-go-cli/internal/ui"
 )
@@ -28,14 +32,21 @@ type Model interface {
 
 type anthropicModel struct {
 	client *anthropic.Client
+
+	// lastReq/lastResp hold the most recent exchange captured by the capture
+	// middleware: the wire request as a curl-runnable command, and the server's
+	// verbatim response body. The agent persists them to the Session's api/ dir.
+	lastReq  []byte
+	lastResp []byte
 }
 
 // NewAnthropicModel wraps a real Anthropic client as a Model.
 func NewAnthropicModel(client *anthropic.Client) Model {
-	return anthropicModel{client: client}
+	return &anthropicModel{client: client}
 }
 
-func (m anthropicModel) Next(ctx context.Context, messages []anthropic.MessageParam, tools []anthropic.ToolUnionParam) (*anthropic.Message, error) {
+func (m *anthropicModel) Next(ctx context.Context, messages []anthropic.MessageParam, tools []anthropic.ToolUnionParam) (*anthropic.Message, error) {
+	m.lastReq, m.lastResp = nil, nil
 	return m.client.Messages.New(ctx, anthropic.MessageNewParams{
 		Model:     defaultModel,
 		MaxTokens: 16000,
@@ -46,7 +57,35 @@ func (m anthropicModel) Next(ctx context.Context, messages []anthropic.MessagePa
 		},
 		Messages: messages,
 		Tools:    tools,
-	})
+	}, option.WithMiddleware(m.capture))
+}
+
+// capture records the exact request the SDK is about to send (rebuilt as a
+// curl-runnable command) and the verbatim response body, so the agent can save
+// each Round's exchange. A retry re-runs this and the final attempt wins.
+func (m *anthropicModel) capture(req *http.Request, next option.MiddlewareNext) (*http.Response, error) {
+	if curl, err := requestToCurl(req); err == nil {
+		m.lastReq = curl
+	}
+	resp, err := next(req)
+	if err != nil || resp == nil {
+		return resp, err
+	}
+	// Drain the response so we hold the verbatim bytes, then hand the SDK a
+	// fresh reader over the same bytes so its own decoding is unaffected.
+	body, rerr := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if rerr == nil {
+		resp.Body = io.NopCloser(bytes.NewReader(body))
+		m.lastResp = body
+	}
+	return resp, err
+}
+
+// LastExchange returns the request/response captured during the most recent
+// Next call. Either may be empty if the request never left the client.
+func (m *anthropicModel) LastExchange() (request, response []byte) {
+	return m.lastReq, m.lastResp
 }
 
 // entryKind distinguishes how a tool result is held and rendered when collapsed.
@@ -143,6 +182,18 @@ func (w *workingSet) get(id string) *entry {
 	return w.byID[id]
 }
 
+// liveCount is the number of entries still in the Working Set — those not yet
+// forgotten. It is surfaced in the input footer.
+func (w *workingSet) liveCount() int {
+	n := 0
+	for _, id := range w.order {
+		if !w.byID[id].forgotten {
+			n++
+		}
+	}
+	return n
+}
+
 func (w *workingSet) getByRef(ref string) *entry {
 	for _, id := range w.order {
 		if e := w.byID[id]; e.ref == ref {
@@ -202,6 +253,7 @@ func (a *Agent) Run(ctx context.Context) error {
 	readUserInput := true
 	for {
 		if readUserInput {
+			ui.SetWorkingSet(a.ws.liveCount())
 			userInput, ok := a.getUserMessage()
 			if !ok {
 				break
@@ -239,6 +291,9 @@ func (a *Agent) Run(ctx context.Context) error {
 		}
 		if err := a.persistTurn(); err != nil {
 			fmt.Fprintln(os.Stderr, "warning: failed to persist turn:", err)
+		}
+		if err := a.persistAPIExchange(); err != nil {
+			fmt.Fprintln(os.Stderr, "warning: failed to persist API exchange:", err)
 		}
 	}
 	return nil
